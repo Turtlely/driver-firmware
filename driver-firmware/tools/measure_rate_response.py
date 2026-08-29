@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure how frame rate affects signal, noise, and the end pixels.
+"""Measure signal, noise, and end-pixel response at several frame rates.
 
 Answers two questions with data rather than reasoning:
 

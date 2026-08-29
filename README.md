@@ -1,89 +1,114 @@
 # driver-firmware
 
-Firmware and host software for a line-scan spectrometer: a Raspberry Pi
-Pico 2 (RP2350), an ADS7279 14-bit ADC, and a CPLD driver board operating a
-Hamamatsu S3903-1024Q linear photodiode array.
+Firmware and host tools for a line-scan spectrometer. The instrument uses a
+Raspberry Pi Pico 2 (RP2350), an ADS7279 14-bit ADC, and a CPLD driver board.
+The sensor is a Hamamatsu S3903-1024Q linear photodiode array.
 
-## System overview
+This page tells you how to use the tools. For the design, read
+`driver-firmware/docs/ARCHITECTURE.md`.
 
-The Pico does not generate sensor timing. The CPLD does. The Pico starts a
-frame, captures the 1024 pixel values the CPLD produces, and streams them
-to the host over USB serial.
+## Before you start
 
-One frame:
-
-1. The Pico asserts a START pulse to the CPLD.
-2. The CPLD scans the sensor one pixel at a time.
-3. For each pixel it drives the sensor and triggers an ADS7279 conversion.
-4. The ADS7279 asserts `~INT` when the result is ready.
-5. `~INT` is wired to a Pico GPIO. Each falling edge means one pixel is
-   ready, and the Pico reads the 16-bit result over SPI.
-6. After 1024 pixels the frame is transmitted and the next one starts.
-
-`~INT` comes from the ADS7279 itself, not from the CPLD as a separate
-marker, so no fixed settling delay is inserted before the read.
-
-## Running the application
+Install Python 3, then install the two packages the tools need:
 
 ```
-python tools/spectrometer_app.py
+pip install pyserial numpy
 ```
 
-Requires `pyserial` and `numpy`. Connect, and the device reports its own
-configuration. Supports live view, frame averaging, fixed-count capture
-with outlier rejection, dark and flat correction, wavelength calibration,
-peak detection, statistics and spectrum export.
+Only one program can open the serial port. Close the application before you
+run a script or a serial monitor.
 
-See `driver-firmware/docs/APPLICATION.md`.
+## Run the application
 
-## Building the firmware
+```
+python driver-firmware/tools/spectrometer_app.py
+```
+
+Select the port, then click **Connect**. The device reports its own
+configuration.
+
+The application gives you a live view, frame averaging, and capture of a fixed
+number of frames. It also gives you dark and flat correction, wavelength
+calibration, peak detection and spectrum export. For full instructions, read
+`driver-firmware/docs/APPLICATION.md`.
+
+To make a Windows desktop shortcut, run this script one time:
+
+```
+powershell -ExecutionPolicy Bypass -File driver-firmware/tools/make_desktop_shortcut.ps1
+```
+
+## Build and flash the firmware
 
 ```
 cd driver-firmware
 pio run -t upload
 ```
 
-PIO headers are regenerated automatically before each build. If upload
-fails because picotool cannot claim the device, put the board in BOOTSEL
-and copy `.pio/build/pico2/firmware.uf2` to the mass-storage drive it
-presents.
+The build regenerates the PIO headers first. Do not run `pioasm` by hand.
+
+If the upload fails because picotool cannot claim the device, flash the board
+by hand. Hold BOOTSEL, connect the board, then copy
+`.pio/build/pico2/firmware.uf2` to the drive that the board presents.
+
+## Other tools
+
+Each script needs the serial port. Close the application first.
+
+| Command | Function |
+|---|---|
+| `python tools/live_view.py [port] [baud]` | Minimal viewer for development. Finds the port if you give no argument. |
+| `python tools/measure_pixel_noise.py [pixel ...]` | Records the values of one or more pixels over time and reports the distribution. |
+| `python tools/measure_rate_response.py` | Measures the effect of frame rate on signal and noise. Takes about two minutes. |
+
+## Serial commands
+
+Send one command for each line, at 115200 baud. The device answers with a line
+that starts with `A `. An error starts with `E `.
+
+| Command | Function |
+|---|---|
+| `id` | Reports the firmware version and all acquisition parameters. |
+| `rate <hz>` | Sets the frame rate. Use `0` for free running. |
+| `period <us>` | Sets the frame period in microseconds. This also sets the integration time. |
+
+The commands below test the hardware. Normal operation does not need them.
+
+| Command | Function |
+|---|---|
+| `pulsewidth` | Measures the low time of the pixel trigger pulse. |
+| `pairs` | Reports the last read triples that did not agree. |
+| `sclk <n>` | Sets the SPI clock half period. Use `0` for normal speed. A large value drops pixels. |
+| `readdelay <us>` | Sets a settling delay before each read. Use `0` for normal operation. |
+| `cfr` | Reads the ADC configuration register eight times. |
+| `cfrw <hex>` | Writes the ADC configuration register, then reads it back. |
+| `mosi <0\|1>` | Sets the idle level of the ADC data input. |
+| `adcreset` | Sends a software reset to the ADC. |
+
+**Warning:** `sclk`, `readdelay` and `mosi` change how the instrument
+captures data. Set each one back to `0` when you finish. `mosi` must return
+to `1`.
 
 ## Documentation
 
 | Document | Contents |
 |---|---|
-| `driver-firmware/docs/ARCHITECTURE.md` | Firmware design, timing, wire protocol |
-| `driver-firmware/docs/APPLICATION.md` | Operating the application, host code design |
-| `driver-firmware/docs/ISSUES.md` | Every defect found, its cause and resolution |
+| `driver-firmware/docs/ARCHITECTURE.md` | Firmware design, timing and wire protocol |
+| `driver-firmware/docs/APPLICATION.md` | Application instructions and host code design |
+| `driver-firmware/docs/ISSUES.md` | Each defect found, its cause and its resolution |
 
-`ISSUES.md` is the right starting point before modifying the capture path.
-Several obvious-looking simplifications have already been tried and have
-already failed.
+Read `ISSUES.md` before you change the capture path. Several obvious
+simplifications were tried before, and each one failed.
 
 ## Repository layout
 
 ```
 driver-firmware/
-  src/main.cpp              firmware
-  src/pixel_trig.pio        PIO trigger debounce
-  tools/spectrometer_app.py application launcher
-  tools/spectrometer/       application modules
-  tools/build_pio.py        pre-build PIO header regeneration
-  tools/live_view.py        minimal development viewer
-  docs/                     documentation
+  src/main.cpp                 firmware
+  src/pixel_trig.pio           PIO trigger debounce
+  tools/spectrometer_app.py    application launcher
+  tools/spectrometer/          application modules
+  tools/build_pio.py           regenerates the PIO headers before a build
+  tools/live_view.py           minimal development viewer
+  docs/                        documentation
 ```
-
-## Hardware notes
-
-- The Pico runs at 3.3 V. The ADS7279 sits in a separate domain behind an
-  external level shifter.
-- SPI is bit-banged on GPIO, not driven by the hardware peripheral, so the
-  clock can be generated on demand per trigger rather than free-running.
-- The SPI read path is placed in RAM. Executing it from flash introduced
-  timing variability that corrupted reads (`ISSUES.md` entry 21).
-
-## Status
-
-Capture is stable: 1024 pixels per frame with no measured loss or
-corruption over extended runs. Known open items, all analog or diagnostic
-rather than capture integrity, are listed at the end of `ISSUES.md`.

@@ -1,124 +1,59 @@
-; pixel_trig.pio
+; Trigger qualification, and the interval measurement that goes with it.
 ;
-; Hardware, ARM-core-jitter-immune debounce for the ADS7279's ~INT/EOC
-; pixel-trigger line. See main.cpp's runScan() history for why this
-; exists - two software approaches were both measured to lose real
-; pixels on hardware:
-;   - An ISR-based FALLING-edge attachInterrupt() can COALESCE two edges
-;     that land closer together than the CPU's interrupt-service latency
-;     into a single interrupt entry - the RP2350's GPIO edge-detect is a
-;     single sticky bit per pin per edge type, not a counter, so a pixel
-;     can silently disappear with no trace in any software counter (there
-;     is nothing to reject; the ISR just never runs a second time).
-;   - A plain CPU busy-poll of the raw pin level can miss a narrow pulse
-;     ENTIRELY if any other interrupt (USB, systick, ...) preempts the
-;     poll loop for the pulse's duration - unlike an edge latch, a level
-;     read has no memory of what happened while the CPU wasn't looking.
-;     This was measured to be WORSE than the ISR approach in practice,
-;     given how much other interrupt activity the USB stack alone
-;     generates.
-; This program runs entirely independently of the ARM core's interrupt
-; controller, so neither failure mode applies to it: it can't be
-; preempted, and it reports confirmed triggers through a real FIFO
-; (joined to depth 8 in main.cpp) rather than a single bit, so even a
-; brief CPU stall of several pixel periods is absorbed rather than
-; silently lost.
+; One FIFO word per accepted trigger, same as before. What changed is the
+; CONTENTS of that word. It used to be "in pins, 1", one bit sampled from a
+; line that is low at that instant, so every word was an identical zero and
+; the CPU threw it away. The CPU then read micros() itself to work out when
+; the trigger happened, which is only correct if the CPU was waiting for it.
+; If the word had been sitting in the FIFO while the CPU was busy - a USB
+; interrupt, a long Serial write - the timestamp was late by an unknown
+; amount, and a whole heuristic existed in runScan() to guess whether to
+; believe it.
 ;
-; Mirrors the exact ARMED/REFRACTORY policy that used to run in software:
-; on a falling edge, push one FIFO word immediately (this is the accepted
-; pixel trigger), then deliberately ignore the pin for a REFRACTORY
-; window (any bounce during that window - measured on hardware as a
-; companion glitch ~1-2 us after the real edge - is invisible to this
-; program by construction, never observed rather than rejected after the
-; fact).
+; The word now carries the number of loop passes the state machine spent
+; waiting for this edge. Two cycles per pass, so 13.33 ns per count at
+; 150 MHz. The CPU adds the known refractory window to get the true interval
+; between accepted triggers. Nothing the CPU does can distort it, because it
+; was counted before the CPU ever saw the word.
 ;
-; REVISION 2 (fixed an intermittent large frame-count drop, e.g. 1024
-; falling to ~800 on some frames): REVISION 1 followed the refractory
-; window with an UNBOUNDED "wait 1 pin 0" before re-arming, added to stop
-; a still-low tail (a real pulse whose low period runs longer than the
-; refractory window) from being immediately re-triggered as a second,
-; spurious pixel. That is correct when the line does return high
-; promptly, but if it EVER fails to return high before this program
-; checks again - noise, an unusually long low period, or two pixels'
-; pulses running together with no clean high in between - the state
-; machine blocks there for the rest of the scan. No further pixels are
-; ever captured after that point, which is exactly the large, variable,
-; intermittent drop that was observed (whatever ordinal count the machine
-; had reached when it stalled). Fixed by bounding that wait.
-;
-; REVISION 3 (THE IMPORTANT ONE - fixed ongoing steady pixel loss that
-; REVISIONS 1 and 2 did not address): REVISIONS 1 and 2 ran this state
-; machine at a clock divider chosen so that ONE PIO CYCLE EQUALED ONE
-; MICROSECOND. That was done purely so REFRACTORY_US could be pushed in
-; from main.cpp as a cycle count with no unit conversion. It is
-; convenient for the refractory counter and WRONG for edge detection.
-;
-; A PIO "wait" instruction samples its pin once per state machine cycle.
-; At 1 us/cycle this program observed ~INT at 1 MHz and was blind between
-; samples. That is precisely the defect this whole design was adopted to
-; escape: moving observation off the ARM core stops it being PREEMPTED,
-; but running it at 1 MHz reintroduces the same blind windows by a
-; different route. A ~INT pulse narrower than the sampling interval, or
-; one that opens and closes between two sample points, was never seen at
-; all - a silently missed pixel, untraceable in any counter, exactly like
-; the CPU-polling failure.
-;
-; This revision runs the state machine at FULL SYSTEM CLOCK (clkdiv 1.0,
-; ~6.7 ns/cycle at 150 MHz), so the pin is sampled roughly 150x per
-; microsecond and no plausible ~INT pulse width can slip between samples.
-; The refractory window is now expressed in CYCLES rather than
-; microseconds: main.cpp converts REFRACTORY_US to a cycle count at
-; runtime using the real system clock frequency and pushes that, so
-; REFRACTORY_US remains the single source of truth in wall-clock terms
-; and nothing here needs hand-editing. X holds a full 32-bit value, so
-; the larger count presents no problem.
-;
-; The refractory cycle count is host-supplied via the standard "pull
-; noblock" idiom (same pattern as mainboard's adc_convst REVISION 9): a
-; value pushed once via pio_sm_put() before the SM is enabled sticks in X
-; until replaced.
+; The host supplies the refractory period in cycles before the machine starts.
 .program pixel_trig
 .wrap_target
 top:
-    pull noblock          ; new refractory count if the CPU pushed one, else OSR <- X (persists)
-    mov x, osr
-    wait 0 pin 0          ; block until the line goes low - the pixel trigger.
-                          ; Sampled every cycle: at clkdiv 1.0 that is ~6.7 ns
-                          ; granularity, not the 1 us of REVISIONS 1-2 (see REVISION 3)
-    in pins, 1            ; capture (always 0/low here) - just needs SOMETHING in the FIFO word
-    push noblock           ; signal one confirmed pixel trigger to the CPU; drop if the CPU has fallen several pixels behind
-    mov y, x                ; countdown scratch copy (x must survive for the next pull noblock)
-refractory_loop:
-    jmp y-- refractory_loop     ; ignore the pin for the refractory window (count is in CYCLES, see REVISION 3)
-    jmp pin top                   ; already high again - re-arm immediately, skip the bounded wait below
-    set y, 31                       ; bounded re-arm wait: 32 iterations x 32 cycles = 1024 cycles
-                                     ; (~6.8 us at 150 MHz). Exact duration is not critical; this is a
-                                     ; safety valve against blocking forever, not a precision timer (REVISION 2)
-rearm_wait:
-    jmp pin top                      ; exit early to the top the moment the line is actually seen high
-    jmp y-- rearm_wait [30]             ; else keep checking, up to the bound (pin still sampled every 32 cycles)
-    ; falls through to .wrap (back to "top") only when the bound is
-    ; exhausted without ever seeing the line go high - re-arms anyway
-    ; rather than blocking indefinitely, see REVISION 2 above
+    pull noblock            ; OSR <- X when TX is empty, so X survives forever
+    mov x, osr              ; X = refractory window, in cycles
+
+    mov y, ~null            ; Y = 0xFFFFFFFF, counts DOWN once per pass
+
+; The line must be seen high before a low can be accepted. Without this, a low
+; region that outlasts the refractory window would be read as a fresh edge the
+; moment the window expires. Both loops below are 2 cycles per pass, so Y
+; counts in the same units either way.
+arm:
+    jmp pin watch           ; high: the line is armed, now watch for the fall
+    jmp y-- arm             ; still low: count and look again
+
+watch:
+    jmp pin keep            ; still high: count and look again
+    jmp fell                ; fell: this is the accepted trigger
+keep:
+    jmp y-- watch
+
+fell:
+    mov isr, ~y             ; ~Y = number of passes waited
+    push noblock            ; one word per trigger, carrying the interval
+
+    mov y, x
+refractory:
+    jmp y-- refractory      ; blackout. The pin is not read at all in here,
+                            ; so bounce inside the window is never observed
+                            ; rather than rejected after the fact.
 .wrap
 
-; raw_edge_count: diagnostic only, runs on a second state machine watching
-; the SAME pin with NO filtering at all - every single low-then-high
-; transition pushes one FIFO word, bounce included. pixel_trig above (and
-; every design before it) only ever reports a DEBOUNCED count; if that
-; count comes up short of 1024, there has been no way to tell whether
-; REFRACTORY_US is discarding genuine pixels that arrived too close
-; together, or whether pulses are being lost before debounce even sees
-; them. Comparing this raw count against pixel_trig's debounced count,
-; per frame, answers that directly: raw count well above 1024 with the
-; debounced count short means REFRACTORY_US is too wide and cutting into
-; real pixels; a raw count that is ALSO short of 1024 means the loss is
-; happening somewhere before either state machine ever sees the edge
-; (electrical, not a debounce tuning problem).
-;
-; Also runs at full system clock (see REVISION 3 above) - a diagnostic
-; that samples more coarsely than the thing it is auditing would report
-; its own blind spots as real signal loss.
+; Diagnostic edge counter, no filtering of any kind. Every low-then-high
+; transition pushes a word, bounce included. Comparing its count against the
+; debounced count is the only measure of how dirty the trigger line is, so it
+; deliberately has no policy in it. Leave it alone.
 .program raw_edge_count
 .wrap_target
     wait 0 pin 0

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Characterise the value distribution of one or more pixels over time.
+"""Measure the distribution and spectrum of selected pixels over time.
 
 Written after a pixel's distribution histogram in the application showed
 two lobes with a dip near the mean, not the single central peak that

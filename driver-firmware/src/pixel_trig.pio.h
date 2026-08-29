@@ -13,29 +13,30 @@
 // ---------- //
 
 #define pixel_trig_wrap_target 0
-#define pixel_trig_wrap 10
+#define pixel_trig_wrap 11
 #define pixel_trig_pio_version 0
 
 static const uint16_t pixel_trig_program_instructions[] = {
             //     .wrap_target
     0x8080, //  0: pull   noblock
     0xa027, //  1: mov    x, osr
-    0x2020, //  2: wait   0 pin, 0
-    0x4001, //  3: in     pins, 1
-    0x8000, //  4: push   noblock
-    0xa041, //  5: mov    y, x
-    0x0086, //  6: jmp    y--, 6
-    0x00c0, //  7: jmp    pin, 0
-    0xe05f, //  8: set    y, 31
-    0x00c0, //  9: jmp    pin, 0
-    0x1e89, // 10: jmp    y--, 9                 [30]
+    0xa04b, //  2: mov    y, ~null
+    0x00c5, //  3: jmp    pin, 5
+    0x0083, //  4: jmp    y--, 3
+    0x00c7, //  5: jmp    pin, 7
+    0x0008, //  6: jmp    8
+    0x0085, //  7: jmp    y--, 5
+    0xa0ca, //  8: mov    isr, ~y
+    0x8000, //  9: push   noblock
+    0xa041, // 10: mov    y, x
+    0x008b, // 11: jmp    y--, 11
             //     .wrap
 };
 
 #if !PICO_NO_HARDWARE
 static const struct pio_program pixel_trig_program = {
     .instructions = pixel_trig_program_instructions,
-    .length = 11,
+    .length = 12,
     .origin = -1,
     .pio_version = pixel_trig_pio_version,
 #if PICO_PIO_VERSION > 0

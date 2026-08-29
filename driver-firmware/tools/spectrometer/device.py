@@ -1,52 +1,4 @@
-"""Serial transport and wire protocol for the S3903-1024Q spectrometer.
-
-Owns the connection to the Pico and nothing else. Parsing, buffering and
-reconnection live here so the user interface never touches a serial port
-directly and never blocks on one.
-
-Wire protocol 2. Frames are binary, everything else is ASCII lines
-terminated by newline, on the same stream.
-
-    <magic> <seq> <captured> <count> <count x uint16> <checksum>
-                            one frame, little-endian, see below
-    I <key>=<value> ...     device identification, on boot and on "id"
-    S <seq> <key> <value> ...               per-frame diagnostics
-    A <key>=<value>                         command acknowledgement
-    E <key>=<value>                         command error
-    BOOT: <text>                            free text, startup only
-
-Frame layout, little-endian:
-
-    uint8[4]      magic, FRAME_MAGIC
-    uint32        sequence
-    uint16        captured count
-    uint16        pixel count
-    uint16[count] pixel data
-    uint16        checksum, sum of data words modulo 65536
-
-Frames were hex-ASCII in protocol 1, which cost two characters per data
-byte and made transmission the frame rate limit: the achievable rate
-ceiling was about 30 fps against a 48.8 Hz sensor limit, and above that
-the host fell behind far enough to lose pixels. Binary halves the cost.
-
-Because frames are binary, the reader cannot work line by line: payload
-bytes include newlines at arbitrary positions. It scans for the magic
-instead, treats anything before it as text, and validates the pixel count
-and checksum before accepting a frame.
-
-Host to device commands:
-
-    id              request an I line
-    rate <hz>       set frame rate, replies with A rate_hz=<n>
-    period <us>     set integration time directly, replies with
-                    A frame_us=<n> rate_hz=<n>
-
-Pixel values are 14-bit codes, 0x0000 to 0x3FFF. The value 0xFFFF is the
-missing-pixel sentinel: no trigger arrived for that slot. It is outside the
-14-bit range so it cannot be confused with a real reading. Missing pixels
-may appear anywhere in a frame, not only at the end, because the firmware
-indexes each pixel by arrival time rather than arrival order.
-"""
+"""Serial transport and protocol parsing for the spectrometer."""
 
 import queue
 import re
@@ -73,9 +25,7 @@ MAX_CODE = FULL_SCALE - 1
 
 @dataclass
 class DeviceInfo:
-    """Parsed contents of the I line. Defaults match the current firmware
-    so the application stays usable if a field is ever absent, but the
-    device is the authority whenever it reports one."""
+    """Parsed contents of the firmware identification line."""
 
     firmware: str = "unknown"
     board: str = "unknown"
@@ -107,8 +57,7 @@ class DeviceInfo:
 
 @dataclass
 class Frame:
-    """One acquired line. `codes` is raw ADC codes with MISSING_PIXEL in
-    any slot that was not captured; `valid` marks the rest."""
+    """One acquired line with a validity mask derived from its codes."""
 
     seq: int
     codes: np.ndarray
@@ -126,8 +75,7 @@ class Frame:
 
 @dataclass
 class FrameStats:
-    """Per-frame diagnostics from the S line. Field names follow the
-    firmware's own vocabulary so the two can be read side by side."""
+    """Per-frame diagnostics using the firmware field names."""
 
     seq: int = 0
     pulses: int = 0
@@ -145,8 +93,7 @@ class FrameStats:
     dur_us: int = 0
     maxread_us: int = 0
     txdrop: int = 0
-    reread: int = 0
-    bad: int = 0
+    stale: int = 0
     text: str = ""
 
 
@@ -202,8 +149,7 @@ def parse_stats(line):
         dur_us=_int(r"dur\s+(\d+)us", line),
         maxread_us=_int(r"maxread\s+(\d+)us", line),
         txdrop=_int(r"txdrop\s+(\d+)", line),
-        reread=_int(r"reread\s+(\d+)", line),
-        bad=_int(r"\bbad\s+(\d+)", line),
+        stale=_int(r"stale\s+(\d+)", line),
         text=line,
     )
 

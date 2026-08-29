@@ -1,19 +1,4 @@
-"""Frame processing: accumulation, reference correction, statistics.
-
-The processing order is fixed and matters:
-
-    raw codes -> volts -> dark subtraction -> flat field -> accumulation
-
-Dark subtraction happens on raw volts, before any gain or display scaling,
-because the dark frame is itself measured in raw volts. Flat fielding
-follows because it corrects per-pixel gain, which only has meaning once the
-additive offset is removed.
-
-Missing pixels are propagated as NaN rather than zero throughout. Zero is a
-legal reading and would silently bias every statistic that touched it; NaN
-forces every consumer to handle the gap explicitly, and numpy's nan-aware
-functions then exclude them from means, sums and extrema by construction.
-"""
+"""Frame conversion, reference correction, and accumulation."""
 
 import numpy as np
 
@@ -65,9 +50,20 @@ def mask_end_pixels(volts, head=MASK_HEAD, tail=MASK_TAIL):
 # Spatial frequency band, in cycles per pixel, occupied by the fixed
 # pattern interference characterised in ISSUES.md entry 31.
 #
-# Measured on this instrument: a single sinusoidal component at 0.3539
-# cycles per pixel, a period of 2.825 pixels, which at the CPLD's 20
-# microsecond pixel period is 17.68 kHz in real time. It is additive
+# The bands are centred on 17.4 kHz. At the CPLD's 20 microsecond pixel
+# period the readout runs at 50 kHz, so 17.4 kHz is 17.4 / 50 = 0.348
+# cycles per pixel, a period of 2.874 pixels.
+#
+# The interferer was first characterised at 17.68 kHz (0.3539 cycles per
+# pixel, period 2.825 pixels). The measurements quoted below and in
+# ISSUES.md entry 31 come from that earlier band. The centre frequency
+# was retuned to 17.4 kHz by hand; it is not backed by a new
+# characterisation sweep. The band widths are unchanged, and the shift
+# of 0.0059 cycles per pixel is under a third of the half width, so the
+# original 0.3539 component stays inside the fundamental band either
+# way.
+#
+# What was measured at 17.68 kHz: the interference is additive
 # (amplitude 47 codes regardless of whether the pixel sits at 2780 or
 # 2345 codes), asynchronous to the readout (50 kHz / 17.68 kHz = 2.825,
 # not an integer, so its phase is uniformly random from frame to frame),
@@ -75,13 +71,15 @@ def mask_end_pixels(volts, head=MASK_HEAD, tail=MASK_TAIL):
 # different frame rates. It accounts for about three quarters of the
 # apparent per-pixel noise variance.
 #
-# The second band is its aliased second harmonic, at about 11 percent of
-# the fundamental. 2 x 0.3539 = 0.7078 exceeds the 0.5 cycles per pixel
-# Nyquist limit of the pixel array and folds back to 1 - 0.7078 = 0.2922.
+# The second band is the aliased second harmonic, at about 11 percent of
+# the fundamental. 2 x 0.348 = 0.696 exceeds the 0.5 cycles per pixel
+# Nyquist limit of the pixel array and folds back to 1 - 0.696 = 0.304.
+# Note that the harmonic band moves up when the fundamental moves down,
+# because the fold reverses the direction.
 #
 # Both bands are wider than the observed drift, by roughly an order of
 # magnitude, so a frequency that wanders slightly is still caught.
-PATTERN_BANDS = ((0.335, 0.375), (0.283, 0.302))
+PATTERN_BANDS = ((0.329, 0.369), (0.295, 0.314))
 
 
 def notch_pattern(volts, bands=PATTERN_BANDS):
@@ -96,8 +94,10 @@ def notch_pattern(volts, bands=PATTERN_BANDS):
     frequency. Real spectral structure is broad: on this instrument 99.96
     percent of the time-averaged frame's energy lies below 0.30 cycles per
     pixel, since an emission line spans several pixels and the
-    illumination envelope spans hundreds. The interference is a spike at
-    0.354. Measured effect of this function on synthetic emission lines
+    illumination envelope spans hundreds. The interference is a spike
+    inside the notched band, measured at 0.354 when it was
+    characterised. Measured effect of this function on synthetic
+    emission lines
     added to real frames: a 3 pixel FWHM line retains 98.7 percent of its
     peak and 100 percent of its area, and 5 pixel and wider lines retain
     100 percent of both.

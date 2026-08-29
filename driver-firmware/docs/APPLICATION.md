@@ -39,7 +39,7 @@ than duplicating it.
 |---|---|
 | Left column | Device, Acquisition, Reference correction, Statistics |
 | Top right | Intensity strip and spectrum plot, horizontally aligned |
-| Bottom right | Calibration, Distribution, Peaks, Diagnostics tabs |
+| Bottom right | Calibration, Distribution, Peaks, Console tabs |
 | Status bar | Port, frame rate, frame count, fault indicators |
 
 The strip and the plot share a pixel axis and are aligned to the same
@@ -313,10 +313,22 @@ calibrated, height, prominence and width.
 This is implemented directly rather than with scipy, keeping the
 dependency list to numpy and pyserial.
 
-## 10. Diagnostics
+## 10. Console
 
-Shows the per-frame `S` lines from the firmware with a decoded summary.
-Fields are documented in `ARCHITECTURE.md` section 7.2.
+A scrollback of everything the device says, and a command line that
+sends to it. The log and the input are one panel: a command and the
+reply it caused belong in one scrollback in the order they happened,
+and the device answers on the same serial stream the frame stats
+arrive on.
+
+The log shows the per-frame `S` lines from the firmware with a decoded
+summary underneath. Fields are documented in `ARCHITECTURE.md` section
+7.2.
+
+Lines are coloured by kind, so a reply is visible in traffic that
+scrolls at the frame rate: a sent command in blue, an `A` acknowledgement
+in green, an `E` error in red, an `I` identification in purple, frame
+stats in grey.
 
 The values that matter during normal operation:
 
@@ -328,6 +340,44 @@ The values that matter during normal operation:
 | `wdog` | 0 | Scan watchdog fired |
 | `nostart` | 0 | CPLD ignored START and retries were exhausted |
 | `txdrop` | stable | Frame text skipped because the host was not draining |
+
+### 10.1 Command line
+
+Type a command and press Enter. `help` lists what the firmware accepts:
+
+| Command | Argument | Effect |
+|---|---|---|
+| `id`, `ver` | | Report firmware identification and current settings |
+| `rate` | hz | Set frame rate in whole hertz; 0 runs free |
+| `period` | us | Set the frame period; finer than `rate` at the slow end |
+| `verbose` | 0 to 2 | Set how much text accompanies each frame |
+| `pulsewidth` | | Measure the trigger pulse low time; about 857 ns is the ADS7279 EOC output, about 5 us the CPLD nTRIG output |
+| `cfr` | | Read the ADC configuration register 8 times |
+| `cfrw` | hex | Write a configuration register value and read it back |
+| `mosi` | 0 or 1 | Set the idle level of SDI |
+| `sclk` | nops | Set the SCLK half period, 0 to 1000 |
+| `readdelay` | us | Set a settling delay before each read, 0 to 10 |
+| `adcreset` | | Issue an ADC software reset |
+
+Anything not in this list is still sent. The firmware answers
+`E unknown_command`, which is a better answer than the application
+refusing to try, since the firmware is the authority on what it accepts.
+
+Three commands are answered by the application itself and never reach
+the device: `help`, `clear` and `history`.
+
+Up and Down recall previous commands. Tab completes a command name, and
+lists the candidates when more than one matches. Ctrl+L clears the log.
+
+`rate` and `period` change device state that the Acquisition panel also
+owns. After either is typed here, the application re-identifies the
+device so the panel shows what is actually set rather than what was
+last requested through it.
+
+Frame stats arrive at the frame rate, so at 20 Hz a reply scrolls out
+of sight in under a second. The Frame stats checkbox mutes them in the
+log without stopping acquisition; the summary line below keeps showing
+the newest values either way.
 
 Copy places the log on the clipboard.
 

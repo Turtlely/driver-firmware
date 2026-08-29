@@ -1,14 +1,4 @@
-"""Spectrometer application for the S3903-1024Q detector.
-
-Layout is fixed and functional: connection and acquisition controls on the
-left, plot and readouts on the right, tabs for the secondary functions.
-Everything needed during a measurement is visible without navigating, and
-the tabs hold work done once per session rather than per measurement.
-
-The user interface never touches the serial port. Device owns the port on
-its own thread and the interface polls queues on a timer, so a slow redraw
-cannot stall acquisition and a disconnect cannot deadlock the window.
-"""
+"""Tk application for the S3903-1024Q spectrometer."""
 
 import time
 import tkinter as tk
@@ -33,12 +23,6 @@ MARGIN_R = 12
 MARGIN_T = 10
 MARGIN_B = 26
 
-# Depth of the per-pixel value history kept for the distribution tab, in
-# frames. Independent of the display averaging depth (Average control),
-# which is a running mean and would smooth out the very noise this history
-# exists to show. At a typical 20 to 40 Hz frame rate this is 12 to 25
-# seconds of samples, enough for a stable histogram without keeping every
-# frame since connection.
 PIXEL_HISTORY_LEN = 500
 HIST_W = 380
 HIST_H = 190
@@ -47,28 +31,9 @@ HIST_MARGIN_R = 26
 HIST_MARGIN_T = 14
 HIST_MARGIN_B = 24
 
-# How many recent frames to average the within-frame ("per-frame")
-# spectrum's power over. Averaging periodograms, not the time-domain
-# signal, is standard (Welch's method with 100% overlap): the
-# interferer's phase is random per frame, so the magnitude averages down
-# to a stable estimate instead of cancelling.
 SPACE_SPEC_FRAMES = 60
-# Peak search on the per-frame spectrum starts here, not at 0 Hz.
-# processing.notch_pattern() established that 99.96 percent of a real
-# frame's spectral energy sits below 0.30 cycles/px (15 kHz at this
-# instrument's 20 us pixel period); measured live, the array's own real,
-# low-frequency illumination content routinely has more raw amplitude
-# than the 17.68 kHz interferer has anywhere. The full curve is still
-# drawn from its lowest bin; only the automatic peak marker is
-# restricted, so it flags the interferer's band rather than the fact
-# that the array is illuminated.
 SPACE_SPEC_PEAK_MIN_HZ = 15000.0
 
-# Light palette. Chosen for contrast on a plot that is read for small
-# amplitude differences, not for appearance: the trace is the darkest
-# element, grid lines are light enough not to compete with it, and the
-# fault colour is distinguishable from the trace for the common forms of
-# colour vision deficiency.
 BG = "#ffffff"
 PANEL = "#f2f2f4"
 FG = "#1f2328"
@@ -83,10 +48,53 @@ PEAK = "#bc4c00"
 CURSOR = "#8c959f"
 STRIP_BORDER = "#c0c0c8"
 
+# Console line colours, keyed by the message kind Device._dispatch
+# assigns. Replies to a typed command are the reason for the colouring:
+# frame stats stream past continuously, so an answer printed in the same
+# ink as the traffic around it is easy to miss.
+LOG_STYLES = {
+    "sent":  {"foreground": TRACE, "font": ("Consolas", 8, "bold")},
+    "ack":   {"foreground": "#1a7f37"},
+    "error": {"foreground": MISSING, "font": ("Consolas", 8, "bold")},
+    "info":  {"foreground": TRACE_REF},
+    "stat":  {"foreground": FG_DIM},
+    "local": {"foreground": FG_DIM, "font": ("Consolas", 8, "italic")},
+    "text":  {"foreground": FG},
+}
 
-# Every field the firmware reports, what it counts, and what a value other
-# than the healthy one indicates. Kept next to the code that displays it so
-# the two cannot drift apart.
+# Commands the firmware accepts, taken from handleCommand() and
+# handleDiagnosticCommand() in src/main.cpp. Used for the console's help
+# text and for Tab completion. Keep in step with the firmware; an entry
+# missing here only costs completion, since anything typed is sent
+# through and the firmware answers "E unknown_command".
+DEVICE_COMMANDS = [
+    ("id", "", "Report firmware identification and current settings."),
+    ("ver", "", "Same as id."),
+    ("rate", "<hz>", "Set frame rate in whole hertz. 0 runs free."),
+    ("period", "<us>", "Set the frame period in microseconds. Finer than "
+                       "rate at the slow end."),
+    ("verbose", "<0-2>", "Set how much text accompanies each frame."),
+    ("pulsewidth", "", "Measure the low time of the trigger pulse. About "
+                       "857 ns is the ADS7279 EOC output; about 5 us is "
+                       "the CPLD nTRIG output."),
+    ("cfr", "", "Read the ADC configuration register 8 times. Tests the "
+                "SDI direction."),
+    ("cfrw", "<hex>", "Write a configuration register value, then read it "
+                      "back. The value does not survive the next pixel."),
+    ("mosi", "<0|1>", "Set the idle level of SDI."),
+    ("sclk", "<nops>", "Set the SCLK half period, 0 to 1000. 0 is the "
+                       "normal fast clock."),
+    ("readdelay", "<us>", "Set a settling delay before each read, 0 to 10."),
+    ("adcreset", "", "Issue an ADC software reset."),
+]
+
+# Typed here, these change device state the Acquisition panel also owns.
+# Re-identify after them so the panel does not keep showing a stale rate.
+RESYNC_COMMANDS = ("rate", "period")
+
+CONSOLE_HISTORY_LEN = 200
+
+
 DIAGNOSTIC_LEGEND = [
     ("pulses", "1024",
      "Pixels captured this frame. The CPLD emits exactly 1024 triggers per "
@@ -106,7 +114,7 @@ DIAGNOSTIC_LEGEND = [
      "should be rock steady; drift means the timing reference moved."),
     ("wdog", "0",
      "The scan watchdog fired: a scan started but did not deliver all its "
-     "pixels within 100 ms."),
+     "pixels within 1.5 times the expected scan length."),
     ("nostart", "0",
      "The CPLD ignored the START pulse and the retries were exhausted. "
      "Distinct from wdog: nothing was emitted at all."),
@@ -120,24 +128,25 @@ DIAGNOSTIC_LEGEND = [
      "converter holds its result until the next conversion, so the data is "
      "still valid. Useful only in reverse, if it ever drops well below the "
      "pixel count."),
-    ("fifo", "1 to 2",
-     "Deepest trigger backlog seen, out of 8. Approaching 8 means the "
-     "processor is not keeping up with the trigger rate and is close to "
-     "dropping one."),
-    ("gap", "17 to 23 us",
-     "Shortest and longest interval between accepted triggers. Spread "
-     "comes from measuring on the processor rather than from the sensor; "
-     "a wide spread is normal, a shifted centre is not."),
+    ("fifo", "1",
+     "Deepest trigger backlog seen, out of 4. Anything above 1 means a "
+     "loop pass overran the pixel period, and the trigger behind it is "
+     "unreadable because its conversion has already been replaced."),
+    ("gap", "20 to 20 us",
+     "Shortest and longest interval between accepted triggers, counted by "
+     "the trigger state machine itself rather than timed on the processor. "
+     "Processor scheduling cannot affect it, so any spread here is real "
+     "jitter in the sensor timing."),
     ("late", "under ~1000 us",
      "How overdue the frame was against its own schedule. Large values "
      "mean something is stalling the acquisition loop."),
     ("dur", "~20500 us",
      "Wall clock time for the whole frame, dominated by the scan. Equal to "
      "the integration time only when running at the maximum rate."),
-    ("maxread", "6 to 14 us",
-     "Longest single ADC read this frame. Includes interrupt activity "
-     "around the read, so the minimum is the true transfer time and the "
-     "maximum reflects system load."),
+    ("maxread", "3 to 4 us",
+     "Longest single ADC read this frame. Interrupts are masked across "
+     "the whole measured region, so this is the transfer itself and "
+     "should be flat. Outliers mean something is preempting it."),
     ("txdrop", "not rising",
      "Frames whose data was discarded because the host had not finished "
      "reading the previous one. A rising count means the link or the host "
@@ -146,12 +155,11 @@ DIAGNOSTIC_LEGEND = [
      "Distribution of the two unused bits of each converter word. They are "
      "constant in healthy operation, so anything in the other buckets "
      "indicates the SPI read lost or gained a clock."),
-    ("reread", "0",
-     "Reads repeated because the two independent reads of the same "
-     "conversion disagreed."),
-    ("bad", "0",
-     "Reads where three attempts all disagreed, so the value returned is a "
-     "best effort rather than a confirmed measurement."),
+    ("stale", "0",
+     "Triggers discarded because a second one had already queued behind "
+     "them. The converter holds only one result, so once the next "
+     "conversion starts the earlier one is gone and cannot be read. Those "
+     "slots are marked missing rather than filled with the wrong pixel."),
     ("px<n>", "-",
      "The value of one nominated pixel, as a code and in millivolts. A "
      "quick sanity check that the signal is where it is expected."),
@@ -161,13 +169,13 @@ DIAGNOSTIC_LEGEND = [
 class SpectrometerApp:
     def __init__(self, root):
         self.root = root
-        self.dev = Device()
+        self.device = Device()
         self.settings = Settings(
             Path.home() / ".s3903_spectrometer" / "settings.json")
         self.cal = Calibration()
         self.cal.from_dict(self.settings.get("calibration", {}))
 
-        self.pixels = self.dev.info.pixels
+        self.pixels = self.device.info.pixels
         self.accum = processing.Accumulator(self.pixels, 1)
         self.dark = None
         self.flat = None
@@ -185,7 +193,7 @@ class SpectrometerApp:
         # A second, genuinely uncorrected buffer (codes_to_volts only, no
         # dark/flat/notch/mask) used exclusively by the space-domain
         # spectrum. That view's entire purpose is showing whatever the
-        # 17.68 kHz notch (processing.notch_pattern, on by default) would
+        # 17.4 kHz notch (processing.notch_pattern, on by default) would
         # otherwise remove; sourcing it from the corrected buffer above
         # would make it blind to the one thing it exists to reveal.
         # Confirmed live: with the notch on, a spatial spectrum built from
@@ -309,7 +317,7 @@ class SpectrometerApp:
                                       command=self._toggle_connection)
         self.connect_btn.pack(side="left")
         ttk.Button(row2, text="Identify", width=10,
-                   command=lambda: self.dev.request_info()).pack(side="left",
+                   command=lambda: self.device.request_info()).pack(side="left",
                                                                  padx=3)
 
         self.dev_label = ttk.Label(box, text="no device", font=("Consolas", 8),
@@ -390,8 +398,9 @@ class SpectrometerApp:
         # On by default: the end pixels are measured artifacts, not data.
         # See processing.mask_end_pixels.
         self.mask_ends = tk.BooleanVar(value=True)
-        # On by default: this removes a measured, non-physical 17.68 kHz
-        # component that otherwise contributes most of the apparent noise.
+        # On by default: this removes a measured, non-physical pattern
+        # component near 17.4 kHz that otherwise contributes most of the
+        # apparent noise.
         # See processing.notch_pattern and ISSUES.md entry 31.
         self.use_notch = tk.BooleanVar(value=True)
         ttk.Checkbutton(box, text="Subtract dark", variable=self.use_dark,
@@ -401,7 +410,7 @@ class SpectrometerApp:
         ttk.Checkbutton(box, text="Mask end pixels (0, 1023)",
                         variable=self.mask_ends,
                         command=self._redraw).pack(anchor="w")
-        ttk.Checkbutton(box, text="Notch 17.68 kHz pattern noise",
+        ttk.Checkbutton(box, text="Notch 17.4 kHz pattern noise",
                         variable=self.use_notch,
                         command=self._redraw).pack(anchor="w")
 
@@ -472,7 +481,12 @@ class SpectrometerApp:
 
     def _build_tabs(self, parent):
         nb = ttk.Notebook(parent)
+        self.tabs = nb
         nb.pack(fill="both", expand=True, pady=(6, 0))
+        # Selecting the Console puts the caret in its command line. A
+        # terminal you have to click into before typing is a terminal you
+        # mistype the first command into.
+        nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         cal = ttk.Frame(nb, padding=6)
         nb.add(cal, text="Calibration")
@@ -495,22 +509,98 @@ class SpectrometerApp:
                                                                   padx=4)
 
         diag = ttk.Frame(nb, padding=6)
-        nb.add(diag, text="Diagnostics")
-        self.diag_text = tk.Text(diag, height=9, font=("Consolas", 8),
-                                 bg=PANEL, fg=FG, wrap="none")
-        self.diag_text.pack(fill="both", expand=True)
-        drow = ttk.Frame(diag)
-        drow.pack(fill="x", pady=(4, 0))
-        ttk.Button(drow, text="Copy", width=8,
-                   command=self._copy_diag).pack(side="left")
-        ttk.Button(drow, text="Clear", width=8,
-                   command=lambda: self.diag_text.delete("1.0", "end")).pack(
-                       side="left", padx=3)
-        ttk.Button(drow, text="What do these mean?", width=22,
+        nb.add(diag, text="Console")
+        self.console_tab = diag
+        self._build_console_tab(diag)
+
+    def _on_tab_changed(self, event=None):
+        if getattr(self, "console_tab", None) is None:
+            return
+        if self.tabs.select() == str(self.console_tab):
+            self.cmd_entry.focus_set()
+
+    def _build_console_tab(self, parent):
+        """Diagnostic log and command line against the connected device.
+
+        The log and the input share one panel deliberately. A command and
+        the reply it produced belong in one scrollback in the order they
+        happened, and the device answers on the same stream the frame
+        stats arrive on, so separating them would only hide which line
+        answered which command.
+        """
+        # Layout by grid, not pack: the log must absorb every spare pixel
+        # while the input row keeps its height at any window size.
+        parent.rowconfigure(0, weight=1)
+        parent.columnconfigure(0, weight=1)
+
+        logbox = ttk.Frame(parent)
+        logbox.grid(row=0, column=0, sticky="nsew")
+        logbox.rowconfigure(0, weight=1)
+        logbox.columnconfigure(0, weight=1)
+        self.diag_text = tk.Text(logbox, height=9, font=("Consolas", 8),
+                                 bg=PANEL, fg=FG, wrap="none",
+                                 insertbackground=FG)
+        self.diag_text.grid(row=0, column=0, sticky="nsew")
+        dscroll = ttk.Scrollbar(logbox, command=self.diag_text.yview)
+        dscroll.grid(row=0, column=1, sticky="ns")
+        self.diag_text.configure(yscrollcommand=dscroll.set)
+        for name, style in LOG_STYLES.items():
+            self.diag_text.tag_config(name, **style)
+        # Read only to the keyboard, but still selectable and copyable.
+        # Typing goes to the entry below instead of being swallowed here.
+        self.diag_text.bind("<Key>", self._console_text_key)
+
+        prompt = ttk.Frame(parent)
+        prompt.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        prompt.columnconfigure(1, weight=1)
+        tk.Label(prompt, text=">", font=("Consolas", 10, "bold"),
+                 bg=BG, fg=TRACE).grid(row=0, column=0, padx=(0, 4))
+        self.cmd_var = tk.StringVar()
+        self.cmd_entry = tk.Entry(prompt, textvariable=self.cmd_var,
+                                  font=("Consolas", 9), bg="#ffffff", fg=FG,
+                                  insertbackground=FG,
+                                  relief="solid", borderwidth=1)
+        self.cmd_entry.grid(row=0, column=1, sticky="ew")
+        self.cmd_entry.bind("<Return>", self._console_submit)
+        self.cmd_entry.bind("<Up>", self._console_history_back)
+        self.cmd_entry.bind("<Down>", self._console_history_forward)
+        self.cmd_entry.bind("<Tab>", self._console_complete)
+        self.cmd_entry.bind("<Control-l>", self._console_clear_event)
+        ttk.Button(prompt, text="Send", width=7,
+                   command=self._console_submit).grid(row=0, column=2,
+                                                      padx=(4, 0))
+
+        # Command history is a ring the Up key walks back through.
+        # cmd_index sits one past the end when nothing is being recalled.
+        self.cmd_history = []
+        self.cmd_index = 0
+        self.cmd_draft = ""
+
+        drow = ttk.Frame(parent)
+        drow.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        # Frame stats arrive at the frame rate. They are what this log was
+        # built for, so they stay on by default, but a reply to a typed
+        # command scrolls away in under a second at 20 Hz, and this mutes
+        # them without stopping acquisition. The summary line below keeps
+        # showing the newest values either way.
+        self.show_stats = tk.BooleanVar(value=True)
+        ttk.Checkbutton(drow, text="Frame stats",
+                        variable=self.show_stats).pack(side="left")
+        ttk.Button(drow, text="Copy", width=7,
+                   command=self._copy_diag).pack(side="left", padx=(6, 0))
+        ttk.Button(drow, text="Clear", width=7,
+                   command=self._console_clear).pack(side="left", padx=3)
+        ttk.Button(drow, text="Commands", width=11,
+                   command=self._console_help).pack(side="left", padx=3)
+        ttk.Button(drow, text="Field meanings", width=15,
                    command=self._show_legend).pack(side="left", padx=3)
-        self.diag_summary = ttk.Label(diag, text="", font=("Consolas", 8),
+
+        self.diag_summary = ttk.Label(parent, text="", font=("Consolas", 8),
                                       justify="left")
-        self.diag_summary.pack(fill="x", pady=(4, 0))
+        self.diag_summary.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+
+        self._log("Type a command and press Enter. "
+                  "\"help\" lists what the firmware accepts.", tag="local")
 
     def _build_dist_tab(self, parent):
         top = ttk.Frame(parent)
@@ -597,8 +687,8 @@ class SpectrometerApp:
         return sel.split()[0]
 
     def _toggle_connection(self):
-        if self.dev.connected:
-            self.dev.disconnect()
+        if self.device.connected:
+            self.device.disconnect()
             self.connect_btn.config(text="Connect")
             self.dev_label.config(text="no device")
             self._log("disconnected")
@@ -609,7 +699,7 @@ class SpectrometerApp:
             messagebox.showwarning(APP_NAME, "No serial port selected.")
             return
         try:
-            info = self.dev.connect(port)
+            info = self.device.connect(port)
         except DeviceError as exc:
             messagebox.showerror(APP_NAME, str(exc))
             return
@@ -635,7 +725,7 @@ class SpectrometerApp:
         self._log(f"connected to {port}")
 
     def _update_device_label(self):
-        i = self.dev.info
+        i = self.device.info
         if i.firmware == "unknown":
             self.dev_label.config(text="connected, device did not identify")
             return
@@ -689,13 +779,13 @@ class SpectrometerApp:
             self.exposure_label.config(text=f"= {us / 1000.0:.2f} ms")
 
     def _apply_exposure(self):
-        if not self.dev.connected:
+        if not self.device.connected:
             return
         us = self._current_us()
         if us is None:
             return
-        lo = self.dev.info.frame_us_min or 20600
-        hi = self.dev.info.frame_us_max or 10000000
+        lo = self.device.info.frame_us_min or 20600
+        hi = self.device.info.frame_us_max or 10000000
         if us < lo:
             messagebox.showwarning(
                 APP_NAME,
@@ -705,7 +795,7 @@ class SpectrometerApp:
             us = lo
         us = max(lo, min(hi, us))
         try:
-            self.dev.set_integration_us(us)
+            self.device.set_integration_us(us)
         except DeviceError as exc:
             messagebox.showerror(APP_NAME, str(exc))
             return
@@ -730,7 +820,7 @@ class SpectrometerApp:
     # ------------------------------------------------------------ capture
 
     def _start_capture(self, kind="spectrum"):
-        if not self.dev.connected:
+        if not self.device.connected:
             messagebox.showwarning(APP_NAME, "Connect to a device first.")
             return
         if kind == "spectrum":
@@ -831,7 +921,7 @@ class SpectrometerApp:
     # ------------------------------------------------------------- render
 
     def _process(self, frame):
-        i = self.dev.info
+        i = self.device.info
         v = processing.codes_to_volts(frame.codes, i.vref_mv, i.full_scale)
         # notch_pattern guards the end pixels itself, so this is
         # independent of the mask setting and of the order of the two.
@@ -852,19 +942,20 @@ class SpectrometerApp:
             self.root.after(POLL_MS, self._poll)
 
     def _poll_once(self):
-        for kind, text in self.dev.drain_messages():
+        for kind, text in self.device.drain_messages():
             if kind == "info":
                 self._update_device_label()
-            self._log(text if kind != "text" else text, tag=kind)
+            self._log(text, tag=kind)
 
-        stats = self.dev.drain_stats()
+        stats = self.device.drain_stats()
         if stats:
             self.last_stats = stats[-1]
-            for s in stats[-6:]:
-                self._log(s.text, tag="stat")
+            if self.show_stats.get():
+                for st in stats[-6:]:
+                    self._log(st.text, tag="stat")
             self._update_diag_summary()
 
-        frames = self.dev.drain_frames()
+        frames = self.device.drain_frames()
         if not frames:
             self._update_status()
             return
@@ -882,7 +973,7 @@ class SpectrometerApp:
             self.accum.push(v)
             self.pixel_history.append(v)
             self.pixel_history_raw.append(processing.codes_to_volts(
-                f.codes, self.dev.info.vref_mv, self.dev.info.full_scale))
+                f.codes, self.device.info.vref_mv, self.device.info.full_scale))
             if self.capture_target:
                 self.capture_frames.append(v)
                 if len(self.capture_frames) >= self.capture_target:
@@ -911,18 +1002,18 @@ class SpectrometerApp:
             self._update_pixel_hist()
 
     def _draw_strip(self, volts):
-        i = self.dev.info
+        i = self.device.info
+        # Absolute shading: black is 0 V and white is the reference
+        # voltage. The scale never follows the data, so the brightness
+        # of a pixel means the same thing in every frame and between
+        # one measurement and the next.
         full = i.vref_mv / 1000.0
-        finite = volts[np.isfinite(volts)]
-        hi = float(np.max(finite)) if finite.size else full
-        if hi <= 0:
-            hi = full
         cells = []
         for v in volts:
             if not np.isfinite(v):
                 cells.append(MISSING)
             else:
-                g = int(max(0.0, min(1.0, v / hi)) * 255)
+                g = int(max(0.0, min(1.0, v / full)) * 255)
                 cells.append(f"#{g:02x}{g:02x}{g:02x}")
         row = "{" + " ".join(cells) + "}"
         self.strip_img.put(" ".join([row] * STRIP_H))
@@ -959,7 +1050,7 @@ class SpectrometerApp:
         which is normal, so a small negative margin keeps those visible
         rather than clipped against the axis.
         """
-        full = self.dev.info.vref_mv / 1000.0
+        full = self.device.info.vref_mv / 1000.0
         return -0.02 * full, full
 
     def _view(self, volts):
@@ -1156,7 +1247,7 @@ class SpectrometerApp:
         if st["valid"] == 0:
             self.stat_label.config(text="no valid pixels")
             return
-        lsb_mv = self.dev.info.vref_mv / self.dev.info.full_scale
+        lsb_mv = self.device.info.vref_mv / self.device.info.full_scale
         noise = self.accum.std()
         noise_finite = noise[np.isfinite(noise)]
         rms = float(np.mean(noise_finite)) if noise_finite.size else float("nan")
@@ -1191,10 +1282,10 @@ class SpectrometerApp:
 
     def _update_status(self):
         parts = []
-        if self.dev.connected:
-            parts.append(f"{self.dev.port}")
+        if self.device.connected:
+            parts.append(f"{self.device.port}")
             parts.append(f"{self.fps:5.2f} fps")
-            parts.append(f"{self.dev.frames_received} frames")
+            parts.append(f"{self.device.frames_received} frames")
         else:
             parts.append("Disconnected")
         if self.last_stats is not None:
@@ -1336,7 +1427,7 @@ class SpectrometerApp:
         spectrum's frequency axis is only as accurate as this number."""
         if self.fps and self.fps > 0:
             return self.fps
-        frame_us = getattr(self.dev.info, "frame_us", None)
+        frame_us = getattr(self.device.info, "frame_us", None)
         if frame_us:
             return 1e6 / frame_us
         return None
@@ -1468,8 +1559,8 @@ class SpectrometerApp:
                       fill=CURSOR, dash=(2, 3))
         c.create_line(ml, mt + plot_h, ml + plot_w, mt + plot_h, fill=AXIS)
 
-        lsb_mv = (self.dev.info.vref_mv / self.dev.info.full_scale
-                  if self.dev.connected else None)
+        lsb_mv = (self.device.info.vref_mv / self.device.info.full_scale
+                  if self.device.connected else None)
         text = f"{name}   n={n}   mean={mean:.3f} mV   std={std:.4f} mV"
         if lsb_mv:
             text += f"  ({std/lsb_mv:.1f} codes)"
@@ -1795,7 +1886,7 @@ class SpectrometerApp:
             return
         spectrum = acc / used
 
-        pixel_period_us = getattr(self.dev.info, "pixel_period_us", 0) or 20.0
+        pixel_period_us = getattr(self.device.info, "pixel_period_us", 0) or 20.0
         fs = 1e6 / pixel_period_us
         freqs = np.fft.rfftfreq(win, d=pixel_period_us * 1e-6)
 
@@ -1999,7 +2090,7 @@ class SpectrometerApp:
         try:
             export.write_spectrum(
                 path, np.arange(len(data)), data, wavelengths=wl,
-                info=self.dev.info, frames=max(1, self.accum.depth),
+                info=self.device.info, frames=max(1, self.accum.depth),
                 elapsed_s=self.accum.depth / self.fps if self.fps else 0.0,
                 dark_applied=self.use_dark.get() and self.dark is not None,
                 flat_applied=self.use_flat.get() and self.flat is not None,
@@ -2010,17 +2101,165 @@ class SpectrometerApp:
             return
         self._log(f"saved {Path(path).name}")
 
-    # --------------------------------------------------------- diagnostics
+    # ------------------------------------------------------------- console
 
     def _log(self, text, tag=None):
         if not hasattr(self, "diag_text"):
             return
+        # Only follow the tail when the view is already at the tail.
+        # Scrolling back to read something must not be undone by the next
+        # frame's stats arriving.
         at_end = self.diag_text.yview()[1] > 0.995
-        self.diag_text.insert("end", text + "\n")
+        tags = (tag,) if tag in LOG_STYLES else ()
+        self.diag_text.insert("end", text + "\n", tags)
         if int(self.diag_text.index("end-1c").split(".")[0]) > 2000:
             self.diag_text.delete("1.0", "500.0")
         if at_end:
             self.diag_text.see("end")
+
+    def _console_text_key(self, event):
+        """Keep the log read only without making it dead.
+
+        Copy, select all and the navigation keys still work. Anything
+        that would edit the buffer moves to the entry instead, so typing
+        while the log holds focus lands where the user meant it to.
+        """
+        if event.state & 0x4:                      # Control held: copy etc.
+            return None
+        if event.keysym in ("Up", "Down", "Left", "Right", "Prior", "Next",
+                            "Home", "End", "Shift_L", "Shift_R"):
+            return None
+        self.cmd_entry.focus_set()
+        if event.char and event.char.isprintable():
+            self.cmd_entry.insert("insert", event.char)
+        return "break"
+
+    def _console_submit(self, event=None):
+        text = self.cmd_var.get().strip()
+        self.cmd_var.set("")
+        if not text:
+            return "break"
+        # Record before the command runs, so one that fails is still
+        # recallable with Up and can be corrected rather than retyped.
+        if not self.cmd_history or self.cmd_history[-1] != text:
+            self.cmd_history.append(text)
+            del self.cmd_history[:-CONSOLE_HISTORY_LEN]
+        self.cmd_index = len(self.cmd_history)
+        self.cmd_draft = ""
+        self._log("> " + text, tag="sent")
+        if not self._console_local(text):
+            self._console_send(text)
+        return "break"
+
+    def _console_local(self, text):
+        """Run the commands this application answers itself.
+
+        Returns True if the command was handled here and must not go to
+        the device.
+        """
+        word = text.split()[0].lower()
+        if word in ("help", "?"):
+            self._console_help()
+            return True
+        if word in ("clear", "cls"):
+            self._console_clear()
+            return True
+        if word == "history":
+            if not self.cmd_history:
+                self._log("  no history", tag="local")
+            for n, item in enumerate(self.cmd_history, 1):
+                self._log(f"  {n:3d}  {item}", tag="local")
+            return True
+        return False
+
+    def _console_send(self, text):
+        try:
+            self.device.send(text)
+        except DeviceError as exc:
+            self._log(f"  not sent: {exc}", tag="error")
+            return
+        # A command that changes frame timing also changes what the
+        # Acquisition panel reports. Ask the device to identify itself
+        # again so the panel follows, instead of showing a rate that is
+        # no longer set.
+        if text.split()[0].lower() in RESYNC_COMMANDS:
+            self.root.after(200, self.device.request_info)
+
+    def _console_history_back(self, event=None):
+        if not self.cmd_history:
+            return "break"
+        if self.cmd_index == len(self.cmd_history):
+            self.cmd_draft = self.cmd_var.get()
+        self.cmd_index = max(0, self.cmd_index - 1)
+        self.cmd_var.set(self.cmd_history[self.cmd_index])
+        self.cmd_entry.icursor("end")
+        return "break"
+
+    def _console_history_forward(self, event=None):
+        if not self.cmd_history:
+            return "break"
+        self.cmd_index = min(len(self.cmd_history), self.cmd_index + 1)
+        if self.cmd_index == len(self.cmd_history):
+            # Past the newest entry is whatever was half typed before the
+            # first Up, not an empty line.
+            self.cmd_var.set(self.cmd_draft)
+        else:
+            self.cmd_var.set(self.cmd_history[self.cmd_index])
+        self.cmd_entry.icursor("end")
+        return "break"
+
+    def _console_complete(self, event=None):
+        """Complete the command word when Tab is pressed.
+
+        Only the first word completes. Arguments are values, and a guess
+        at a value would be worse than no help at all.
+        """
+        text = self.cmd_var.get()
+        if " " in text.strip():
+            return "break"
+        prefix = text.strip().lower()
+        names = ([n for n, _, _ in DEVICE_COMMANDS]
+                 + ["help", "clear", "history"])
+        hits = [n for n in names if n.startswith(prefix)]
+        if not hits:
+            return "break"
+        if len(hits) == 1:
+            # A trailing space only where an argument follows, so a bare
+            # command is ready for Enter.
+            takes_arg = any(n == hits[0] and arg
+                            for n, arg, _ in DEVICE_COMMANDS)
+            self.cmd_var.set(hits[0] + (" " if takes_arg else ""))
+        else:
+            # Fill in as far as the candidates agree, then list them.
+            common = hits[0]
+            for h in hits[1:]:
+                while not h.startswith(common):
+                    common = common[:-1]
+            self.cmd_var.set(common)
+            self._log("  " + "  ".join(hits), tag="local")
+        self.cmd_entry.icursor("end")
+        return "break"
+
+    def _console_help(self):
+        self._log("firmware commands", tag="local")
+        for name, arg, meaning in DEVICE_COMMANDS:
+            label = (name + " " + arg).strip()
+            self._log(f"  {label:<16} {meaning}", tag="local")
+        self._log("console commands", tag="local")
+        for label, meaning in (
+                ("help", "This list."),
+                ("clear", "Empty the log. Ctrl+L does the same."),
+                ("history", "Show the commands sent this session.")):
+            self._log(f"  {label:<16} {meaning}", tag="local")
+        self._log("  Up and Down recall history. Tab completes a command.",
+                  tag="local")
+
+    def _console_clear(self):
+        self.diag_text.delete("1.0", "end")
+
+    def _console_clear_event(self, event=None):
+        self._console_clear()
+        return "break"
 
     def _show_legend(self):
         win = tk.Toplevel(self.root)
@@ -2062,11 +2301,11 @@ class SpectrometerApp:
                   f"gap {s.gap_min}-{s.gap_max}us   late {s.late_us}us   "
                   f"dur {s.dur_us}us   maxread {s.maxread_us}us\n"
                   f"wdog {s.wdog}   nostart {s.nostart}   retry {s.retry}   "
-                  f"reread {s.reread}   txdrop {s.txdrop}"))
+                  f"stale {s.stale}   txdrop {s.txdrop}"))
 
     def on_close(self):
         self._persist_cal()
-        self.dev.disconnect()
+        self.device.disconnect()
         self.root.destroy()
 
 

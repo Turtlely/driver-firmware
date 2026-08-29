@@ -1,4 +1,4 @@
-"""Regenerate PIO headers before every firmware build.
+"""Regenerate PIO headers when their source files change.
 
 pixel_trig.pio.h is a generated file. Without this script it is generated
 by hand, which means editing pixel_trig.pio and forgetting to re-run

@@ -1,15 +1,4 @@
-"""Spectrum export.
-
-Written as commented tab-separated text so a saved spectrum is readable in
-a text editor, loads directly with numpy.loadtxt or pandas.read_csv, and
-carries enough header to be interpreted years later without the software
-that produced it.
-
-Acquisition conditions go in the header for the same reason. A spectrum
-without its integration time, reference-correction state and calibration is
-not reproducible, and those are exactly the details that are forgotten
-first.
-"""
+"""Export spectra and reference arrays."""
 
 import time
 
@@ -36,7 +25,7 @@ def write_spectrum(path, pixels, volts, *, wavelengths=None, info=None,
     a(f"# integration_s:    {elapsed_s:.3f}")
     a(f"# dark_subtracted:  {'yes' if dark_applied else 'no'}")
     a(f"# flat_corrected:   {'yes' if flat_applied else 'no'}")
-    a(f"# pattern_notched:  {'yes, 17.68 kHz' if notch_applied else 'no'}")
+    a(f"# pattern_notched:  {'yes, 17.4 kHz' if notch_applied else 'no'}")
     a(f"# calibration:      {calibration.describe() if calibration else 'none'}")
     if calibration is not None and calibration.valid:
         pts = ", ".join(f"{p:.1f}px={w:.3f}nm" for p, w in calibration.points)
