@@ -1,4 +1,4 @@
-# Spectrometer Application
+# Helios Application
 
 Host software for the S3903-1024Q detector. Covers operation and the
 design of the application code. Firmware internals are in
@@ -22,25 +22,32 @@ it. Windows grants a COM port to one process at a time. Close any serial
 monitor or second copy of the application and retry.
 
 **Desktop shortcut.** `powershell -ExecutionPolicy Bypass -File
-tools\make_desktop_shortcut.ps1` creates `Spectrometer.lnk` on the
-desktop, pointing at the `.venv` Python and `icon.ico` (built from
-`tools/spectrometer/icon.jpg`; re-run `python -c "from PIL import Image;
-Image.open('tools/spectrometer/icon.jpg').convert('RGBA').save(
-'tools/spectrometer/icon.ico', sizes=[(16,16),(24,24),(32,32),(48,48),
-(64,64),(128,128),(256,256)])"` with Pillow installed if the source
-image ever changes; Pillow is a build-time tool for this one step only,
-not a runtime dependency). Uses `pythonw.exe` so no console window opens
-alongside the GUI. Safe to re-run; it overwrites its own shortcut rather
-than duplicating it.
+tools\make_desktop_shortcut.ps1` creates `Helios.lnk` on the
+desktop, pointing at the `.venv` Python and `tools/spectrometer/icon.ico`.
+Uses `pythonw.exe` so no console window opens alongside the GUI. Safe to
+re-run; it overwrites its own shortcut rather than duplicating it.
+
+**Icon.** `python tools/make_logo.py` writes both
+`tools/spectrometer/logo.png`, which the window and the taskbar use, and
+`tools/spectrometer/icon.ico`, which the shortcut uses. It draws every
+size at its own resolution rather than scaling one large image down,
+because the mark is five hard colour boundaries and a resampled boundary
+is a smear. Run it only if the mark changes. It needs Pillow, which is a
+build-time tool for this one step and not a runtime dependency.
 
 ## 2. Layout
 
 | Region | Contents |
 |---|---|
-| Left column | Device, Acquisition, Reference correction, Statistics |
+| Menu bar | File, Device, Calibration, View, Help (diagnostic legend, About) |
+| Left column | Preview, Capture, Reference correction, Statistics |
 | Top right | Intensity strip and spectrum plot, horizontally aligned |
-| Bottom right | Calibration, Distribution, Peaks, Console tabs |
+| Bottom right | Calibration, Distribution, Peaks, Files, Console tabs |
 | Status bar | Port, frame rate, frame count, fault indicators |
+
+The menu bar holds one-shot actions and settings that change rarely:
+opening and saving a file, choosing a port, connecting, moving the
+calibration between this computer and the instrument, and the theme.
 
 The strip and the plot share a pixel axis and are aligned to the same
 origin, so a feature in one can be read directly against the other.
@@ -68,24 +75,70 @@ The vertical axis is not autoscaled at the home view for the reasons in
 section 12.1; zooming is a separate, explicit action and does not change
 that default.
 
-## 4. Device panel
+## 4. Device menu
+
+Choose the port from **Device > Port** and press **Device > Connect**. The
+port list is read when the menu is opened, so a device plugged in after
+startup needs no rescan.
 
 Connect queries the device for identification rather than waiting for its
 boot banner, because the device may have been running long before the
-application started. The panel then shows firmware version, board, pixel
-count, resolution, reference voltage, system clock, build date, and the
-PIO program checksum.
+application started. There is no Identify command: the device identifies
+itself when the port opens and whenever it sends an `I` line. What it
+reported is shown at the top of the Console tab: firmware version, board,
+pixel count, resolution, reference voltage, system clock, build date, the
+PIO program checksum, and the result of the boot self test.
+
+### 4.1 The boot self test
+
+The device runs an SPI self check and then an ADC reset on every boot,
+before it takes a single frame. It costs tens of microseconds.
+
+The self check is the only thing that tests the SDI direction. A pixel read
+does not drive SDI at all, so every frame proves SDO works and proves
+nothing about SDI. **An SDI fault is silent.** The line stuck high sends
+command 1111b, default mode, which the ADS7279 answers with plausible
+conversion data, so a broken instrument goes on producing normal-looking
+spectra. Running the check only when someone remembers to type `sditest`
+means running it after the data is suspect rather than before it is taken.
+
+The reset puts the part into a known state. Firmware wrote no ADC
+configuration at boot before firmware 1.4, so the first scan after a power
+cycle used whatever the ADC came up in. The reset also consumes the
+all-ones cycle the datasheet says SDO produces immediately afterwards;
+without that, the first pixel read returns `FFFC`, which is full scale and
+looks like a real bright spike.
+
+Nothing in the sequence waits on an external signal, so a missing or dead
+ADC reports FAIL rather than hanging the boot.
+
+The outcome is carried in the `I` line as `selftest=<0|1>` and shown on the
+device label, because the boot lines scroll past long before anyone
+connects. A failure is also logged once on connect. Run it again at any
+time with the `selftest` console command; `sditest` and `adcreset` still
+run each half on its own.
+
+The lines it emits are the existing `A sditest` and `A adcreset` lines,
+followed by one summary:
+
+```
+A selftest=PASS spi=PASS adcreset=PASS
+```
+
+If SDI is dead, the reset cannot be armed and reports
+`inconclusive_not_armed`, which says nothing about why. That is why the
+self check runs first: it names the fault the reset can only fail to
+diagnose.
 
 The PIO checksum is worth noting after firmware changes. It is computed
 over the instruction words actually linked into the running binary. If a
 `.pio` source is edited and the checksum does not change, the running
 firmware does not contain the edit. See `ISSUES.md` entry 25.
 
-## 5. Acquisition
+## 5. Preview
 
-**Rate.** Frame rate in hertz, 1 to 60, plus 0 for free running. Exposure
-is set by the interval between START pulses, so this is the primary
-exposure control.
+**FPS and integration.** The two fields represent one frame period and
+update each other. FPS is the default input.
 
 40 Hz is the clean ceiling, measured with zero dropped frames, zero
 missing pixels and zero checksum errors. Above 44 Hz the frame period
@@ -99,19 +152,21 @@ rate to about 30 fps. Protocol 2 halved the frame size and moved the limit
 back to the scan, which is fixed by the CPLD pixel clock at 20 microseconds
 per pixel and cannot be raised in firmware.
 
-**Average.** Running mean over the last N frames, updated continuously.
-Averaging N frames reduces random noise by the square root of N. Missing
-pixels are excluded per pixel rather than per frame, so a pixel that drops
-out occasionally is still averaged correctly over the frames where it was
-present.
-
-**Capture N.** Acquires a fixed number of frames and combines them with
+**Stack.** Acquires a fixed number of preview frames and combines them with
 sigma-clipped averaging, which rejects per-pixel outliers before
 averaging. Use this for a final measurement rather than reading the live
-average.
+preview.
 
-**Freeze.** Holds the current display for inspection or saving while
-acquisition continues in the background.
+**Pause and Play.** The button says what pressing it will do. It reads
+**Pause** only while live data is on screen. It reads **Play** when the
+device is not transmitting, and also when a stacked result or a file opened
+from disk is held over the plot, because in that state nothing on screen is
+updating even though the device is still sending.
+
+Pause stops the device transmitting frames. The display holds what it last
+showed. The device keeps scanning either way, so the detector is never left
+integrating with nothing to flush it. Play puts a held spectrum away and,
+if the device was stopped, starts the frames again.
 
 ## 6. Reference correction
 
@@ -161,6 +216,45 @@ verifiable", not "perfect". Add a third point before trusting the fit.
 
 Calibration persists in `~/.s3903_spectrometer/settings.json`.
 
+### 7.1 Calibration on the device
+
+A calibration describes the optics, not the computer that measured them,
+so the instrument keeps its own copy. It lives in the RP2350's flash, in
+`/cal.txt`, and not on the memory card: a card can be swapped or removed,
+and the calibration has to stay with the instrument when it is.
+
+| Action | Where |
+|---|---|
+| Write the current points into the device | Calibration > Save to device, or the button on the Calibration tab |
+| Read the device's points back | Calibration > Load from device |
+| Erase the device's copy | Calibration > Clear on device |
+| Write the points to a file on this computer | Calibration > Export to file |
+| Read points from such a file | Calibration > Import from file |
+
+Every connect reads the device's calibration and adopts it, so plugging in
+a calibrated instrument calibrates the window. A device that holds nothing
+leaves the local points alone.
+
+The label beside the buttons on the Calibration tab says whether the
+instrument agrees with what is on screen. "device holds these N points"
+means the two match. "device holds N different points" means points have
+been edited here and not sent.
+
+What is stored is the reference POINTS, not the fitted polynomial. The
+polynomial follows from the points and from the degree rule above, and
+that rule lives in one place, `calibration.py`. A device holding
+coefficients as well could hold two answers that disagree, with nothing to
+say which was right.
+
+Up to 16 points fit. The whole list travels as one command line, and the
+firmware discards an over-long line rather than truncating it, so the
+window refuses to send a list that would not fit rather than letting it
+fail silently.
+
+If the flash filesystem will not mount, the device reports `cal_store=0`.
+The commands still work and the calibration still applies, but nothing
+survives a power cycle, and the window says so.
+
 ## 8. Pixel distribution
 
 Click a pixel on the plot (the same click that sets the calibration pixel
@@ -173,23 +267,16 @@ The default view: that pixel's readings over time, with a Gaussian curve
 at the sample mean and standard deviation drawn over it for comparison by
 eye.
 
-This is corrected, per-frame data, not the displayed trace. The displayed
-trace is `Accumulator.mean()`, already smoothed by the Average setting; a
-histogram of that would show the averaging, not the noise it is averaging
-away. "Corrected" here means dark, flat, notch and mask are applied
-exactly as their toggles say, the same as the plot; it is "not
-Accumulator-averaged" that makes this different from the displayed trace,
-not "uncorrected." The tab keeps its own history of up to 500 frames per
-pixel, independent of the Average control, specifically so this stays a
-measurement of the underlying noise rather than of the averaging.
+This is corrected per-frame data. The tab keeps its own history of up to
+500 frames per pixel.
 
-A Gaussian is the expected shape, and with the pattern notch on (section
-12.6, the default) that is what this instrument gives: measured excess
+A Gaussian is the expected shape after the fixed pattern correction in
+section 12.6: measured excess
 kurtosis +0.01. Noise of thermal and amplifier origin is a sum of many
 small independent contributions, which by the central limit theorem tends
 to Gaussian regardless of the shape of any individual source.
 
-Turn the notch off and the histogram becomes visibly flat topped, excess
+Without the correction the histogram becomes visibly flat topped, excess
 kurtosis about -1.3. That is not a second noise source but the 17.68 kHz
 interferer described in section 12.6: a sinusoid sampled at random phase
 is arcsine distributed, which is flat topped with a dip at the mean. This
@@ -265,8 +352,8 @@ spectra across frames is standard practice for exactly this (Welch's
 method) and turns a noisy single-frame estimate into a stable one.
 
 **Sourced from uncorrected data, unlike the other two views.** The
-pattern notch (section 12.6) removes precisely the frequency band this
-view exists to show, and it is on by default. Confirmed live: computed
+fixed pattern correction (section 12.6) removes precisely the frequency
+band this view exists to show. Confirmed live: computed
 from the corrected buffer, this view could not see the interferer at
 all, and its peak marker read out the array's own low-frequency
 illumination shape instead, at whatever the lowest resolvable frequency
@@ -289,9 +376,7 @@ percent of a real frame's spectral energy already sits below it.
 "Clear history" applies to all three views; they share the same
 underlying per-frame buffers (a corrected one and an uncorrected one,
 section 8.3). The history clears on reconnect and on any change to
-exposure, since exposure changes what is being measured; it does not
-clear when the Average control changes, since that only affects the
-displayed trace, not these buffers. Clear it manually after changing
+exposure, since exposure changes what is being measured. Clear it manually after changing
 anything else that might shift the distribution, such as reference
 correction.
 
@@ -351,13 +436,14 @@ Type a command and press Enter. `help` lists what the firmware accepts:
 | `rate` | hz | Set frame rate in whole hertz; 0 runs free |
 | `period` | us | Set the frame period; finer than `rate` at the slow end |
 | `verbose` | 0 to 2 | Set how much text accompanies each frame |
-| `pulsewidth` | | Measure the trigger pulse low time; about 857 ns is the ADS7279 EOC output, about 5 us the CPLD nTRIG output |
 | `cfr` | | Read the ADC configuration register 8 times |
 | `cfrw` | hex | Write a configuration register value and read it back |
-| `mosi` | 0 or 1 | Set the idle level of SDI |
 | `sclk` | nops | Set the SCLK half period, 0 to 1000 |
 | `readdelay` | us | Set a settling delay before each read, 0 to 10 |
-| `adcreset` | | Issue an ADC software reset |
+| `adcreset` | | Reset the ADC and verify the reset took effect |
+| `sditest` | | Test SDI end to end: command field and data field |
+| `cfrloop` | secs | Repeat the read-CFR transfer for 1 to 10 s, for scope work |
+| `pindiag` | | Test the four ADC pins for a stuck net; needs no scope |
 
 Anything not in this list is still sent. The firmware answers
 `E unknown_command`, which is a better answer than the application
@@ -369,7 +455,7 @@ the device: `help`, `clear` and `history`.
 Up and Down recall previous commands. Tab completes a command name, and
 lists the candidates when more than one matches. Ctrl+L clears the log.
 
-`rate` and `period` change device state that the Acquisition panel also
+`rate` and `period` change device state that the Preview panel also
 owns. After either is typed here, the application re-identifies the
 device so the panel shows what is actually set rather than what was
 last requested through it.
@@ -391,8 +477,97 @@ integration time, correction state, calibration and detected peaks. A
 spectrum without those is not reproducible, and they are the details
 forgotten first.
 
-Missing pixels are written as `NaN`, never zero. Zero is a legal reading
-and would bias any statistic computed over the file.
+Every header line is a field, `# key: value`, apart from the title on the
+first line and the tab-separated peak rows. The header carried explanatory
+sentences until firmware 1.4. They are gone. A sentence in a data file
+cannot be parsed, it goes stale against the code that writes it, and it is
+already here.
+
+Missing pixels are written as `NaN`, never zero (`# missing_value: NaN`).
+Zero is a legal reading and would bias any statistic computed over the
+file.
+
+### 11.1 Opening a file
+
+**File > Open spectrum** reads two forms, neither of which needs a device
+attached:
+
+- `.STK`, the record the firmware writes to the card. It is decoded by
+  `spectrometer/stkfile.py`, the same module `tools/read_stk.py` uses, so a
+  card read in a card reader opens exactly like a stored file does. The
+  capture counters come with it.
+- `.txt`, a file this program wrote. Only the columns are read.
+
+The spectrum is held over the plot, and the Preview button changes to
+**Play**. Press it to go back to live data.
+
+### 11.2 The Files tab
+
+The card browser. Everything shown is read from the card, so a card
+carried over from another instrument appears exactly like a file written a
+minute ago.
+
+The line at the top right says how the card is formatted and how full it
+is, in GB. Measuring the free space walks the whole file allocation table
+on the device and takes seconds on a large card, so it is measured on
+Refresh and not on the status poll that runs during a capture.
+
+### 11.3 Card size
+
+**The ceiling is 2 TiB, and a 1 TB card works.** SdFat addresses the volume
+with 32-bit sector and cluster numbers over 512-byte sectors, so 2^32 × 512
+bytes is the hard limit. Cards above that are the SDUC class, which SdFat
+does not support over SPI in any case.
+
+A card of that size must be exFAT. FAT32 is not a practical option above
+about 32 GB, and exFAT is what a 1 TB card ships formatted as. SdFat is
+built here with `SDFAT_FILE_TYPE 3`, which compiles in FAT16, FAT32 and
+exFAT, and the firmware already uses `SdFs` and `FsFile` throughout, so no
+change is needed to read one. The device reports exFAT as `fat=64`, which
+the window shows as `exFAT` rather than inventing a "FAT64".
+
+Two things to know before fitting one:
+
+**Free space costs far more on FAT32 than on exFAT.** exFAT keeps an
+allocation bitmap, so a 1 TB volume is about 1 MB to read. FAT32 has no
+bitmap and the whole file allocation table has to be walked: at a 32 kB
+cluster that is 134 MB, which over SPI is minutes, and the read happens
+inside `loop()` and stalls the scan for its duration. This is another
+reason a large card should be exFAT. Free space is only measured on
+Refresh, never on the status poll.
+
+**The file name is the real ceiling, not the card.** Names are
+`TTNNNNNN.STK`, so the sequence number runs out at 999,999 files, which at
+roughly 8 kB each is about 8 GB. Everything above that is reachable only by
+renaming files out of the sequence. A larger card buys margin and wear
+levelling, not more spectra.
+
+The card and the mounted volume are separate numbers, and the device now
+reports both: `size_mb` is the physical card from its capacity register,
+`vol_mb` is the mounted partition. Files live on the volume, so every "how
+full" figure is measured against `vol_mb`. When a card carries a partition
+materially smaller than itself the window says so — `FAT16, 0.78 of 3.7 GB
+used (21.1 %) (card 117.8 GB)` — because that is a formatting fault: most
+of the card is unreachable, and nothing else in the window would report it.
+
+**Search** filters the listing already in hand, by name, kind or date. It
+sends nothing to the device, so it stays instant while a capture runs.
+
+**Sort** by clicking a column heading. Clicking the same one again
+reverses it. The default is newest first, by the sequence number in the
+name rather than by the date: the number always increases, while the date
+is 2000-01-01 for anything written before the host handed the device a
+clock.
+
+**Rename** (button, or F2) gives a file a different name. FAT holds 8.3
+names, so the new name is 1 to 8 characters from `A-Z`, `0-9`, `-` and
+`_`; the extension stays `.STK`, because a spectrum with any other
+extension stops appearing in the listing. The device refuses a name that
+is already taken rather than overwriting it.
+
+Renaming loses the sequence number the name encodes. Nothing depends on
+it. The capture id inside the record is the identity, and the device reads
+the directory to decide where to continue numbering.
 
 ## 12. Interpreting the display
 
@@ -562,8 +737,7 @@ them by construction.
 
 ### 12.6 Pattern noise notch
 
-**Notch 17.68 kHz pattern noise**, in Reference correction, is on by
-default. It removes a measured, non-physical component of the analog
+The 17.68 kHz correction is always applied. It removes a measured non-physical component of the analog
 video signal, in the same category as dark subtraction rather than as
 smoothing.
 
@@ -591,10 +765,6 @@ stacking like ordinary noise: what survives a 399 frame stack is 0.57 mV.
 An earlier version of this correction left a much larger oscillation at
 the two ends that did **not** average away. If you see that, the software
 is out of date. See `ISSUES.md` entry 32.
-
-Turning it off is reasonable when you need to see the instrument's raw
-behaviour, or to confirm a narrow feature is real. It costs a factor of
-about 4.6 in noise.
 
 **It does not remove real spectral content.** Interference and signal do
 not overlap in spatial frequency: 99.96 percent of a real frame's energy
@@ -624,7 +794,10 @@ tools/
     processing.py              volts, references, accumulation, statistics, peaks
     calibration.py             wavelength fit, settings persistence
     export.py                  spectrum and reference file formats
+    stkfile.py                 stacked capture record format
+    typography.py              interface and readout fonts
     app.py                     user interface
+    fonts/                     Inter, bundled under the SIL Open Font License
 ```
 
 **Separation.** The user interface never touches a serial port. `Device`
@@ -647,15 +820,75 @@ numpy's nan-aware functions exclude them by construction.
 rather than interpolating across them. A straight line over a gap is
 invented data.
 
+**Two fonts, on purpose.** The interface uses Inter, bundled in
+`tools/spectrometer/fonts/` and loaded for this process only, so nothing
+is installed on the machine. The console and every numeric readout stay
+on Consolas. Those readouts are columns of digits that change while you
+watch them, and a proportional font makes the columns move as the digit
+widths change. Do not move the readouts to the interface font.
+`typography.py` holds the rule and the fallbacks used where Inter cannot
+be loaded.
+
 ## 14. Command protocol
 
 Requests are plain text lines. Responses share the frame stream.
+
+### 14.1 Line prefixes
+
+Every line the device sends starts with one letter naming what it is. The
+host routes and colours by that letter alone, so a line under the wrong one
+is not a cosmetic problem.
+
+| Prefix | Meaning |
+|---|---|
+| `I` | Identification. The `I` line is a contract; see below. |
+| `S` | Per-frame statistics, one per frame at verbosity 1 |
+| `T` | Per-frame trigger count, one per frame |
+| `C` | Capture status |
+| `D` | Card: `state`, `file`, `list_end`, `saved`, `deleted`, `renamed` |
+| `K` | Calibration |
+| `H` | Hardware test result: `sditest`, `adcreset`, `selftest`, `cfr`, `cfrw`, `cfrloop`, `pindiag` |
+| `A` | Acknowledgement of a command that changed a setting |
+| `E` | Error |
+
+`T` and `H` are new in firmware 1.4, and both were carved out of prefixes
+that did not describe them:
+
+- The trigger count went out as `E frame …`. The host classified it as an
+  error and drew it red and bold, under the Errors filter, at one line per
+  frame. It is a routine diagnostic, so it now shares the Frames filter with
+  the `S` line — which is off by default, and is why it no longer floods the
+  console.
+- The hardware tests went out as `A …`. Acknowledgements are drawn in the
+  success colour, so a line ending `FAIL` was green. They now carry `H`, and
+  the console colours each one by its own verdict rather than by its prefix.
+
+The other prefixes were left alone. A rename that fixes nothing costs every
+script that reads the stream.
 
 | Command | Response |
 |---|---|
 | `id` | `I` line with device identification |
 | `rate <hz>` | `A rate_hz=<n>`, 0 means free running |
+| `selftest` | `A sditest`, `A adcreset`, then `A selftest=<PASS\|FAIL> spi=… adcreset=…` |
+| `cal get` | `K cal n=<points> bytes=<n> store=<0\|1> points=<list>` |
+| `cal set <px>:<nm>,...` | the same `K` line, or `E cal bad_points` |
+| `cal clear` | the same `K` line |
+| `sd rename name=<f> to=<f>` | `D renamed name=<f> to=<f>` |
 | unrecognised | `E unknown_command=<text>` |
+
+The full list is in the window: **Console > Commands**.
+
+Calibration replies use `K`, not `A`, because the reply carries the whole
+point list and needs a parser of its own rather than being logged as an
+acknowledgement. The point list is `<pixel>:<nm>` pairs separated by
+commas; the firmware validates the character set and the length and stores
+the bytes, and never parses a number out of them. Nothing on the device
+uses a wavelength.
+
+The command line buffer is 384 bytes, sized so `cal set ` and a full
+16-point list both fit. An over-long line is discarded, not truncated, so
+a request that does not fit never arrives at all.
 
 Frames are binary in protocol 2; status lines, replies and identification
 remain ASCII on the same stream. All of it is emitted through one output

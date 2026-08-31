@@ -19,6 +19,17 @@ import numpy as np
 
 MAX_DEGREE = 3
 
+# The device stores the reference points, not the fitted polynomial, as one
+# line of text. These two must match CAL_TEXT_MAX and the command buffer in
+# src/main.cpp: the whole request is "cal set " plus the text, and the
+# firmware discards an over-long line rather than truncating it.
+DEVICE_TEXT_MAX = 320
+DEVICE_VERB_BYTES = 8
+
+# The number of points that is guaranteed to fit. A point is at most 18
+# characters ("1023.99:1099.9990,"), so 16 of them need 288 of the 319 usable.
+DEVICE_POINTS_MAX = 16
+
 
 class Calibration:
     """Pixel to wavelength mapping. Empty until at least two points are
@@ -114,6 +125,61 @@ class Calibration:
     def from_dict(self, d):
         self.points = [tuple(p) for p in d.get("points", [])]
         self.refit()
+
+    # ------------------------------------------------------ device store
+
+    def to_device_text(self):
+        """The points in the form the device stores.
+
+        "<pixel>:<nm>,<pixel>:<nm>,..." and nothing else. The coefficients
+        are deliberately not sent. They follow from the points and from the
+        degree rule in refit(), and that rule lives here alone; a device
+        holding both could hold two that disagree.
+
+        Raises ValueError if the result would not fit the device command
+        line, because a request that does not fit is discarded by the
+        firmware rather than truncated, and would fail silently.
+        """
+        text = ",".join(f"{p:.2f}:{w:.4f}" for p, w in self.points)
+        limit = DEVICE_TEXT_MAX - 1
+        if len(text) > limit:
+            raise ValueError(
+                f"{len(self.points)} points need {len(text)} characters; "
+                f"the device holds {limit}")
+        return text
+
+    def from_device_text(self, text):
+        """Replace the points with what the device sent. Returns the count.
+
+        Anything unparsable is skipped rather than raising. The device
+        validates the character set but not the arithmetic, and a single bad
+        pair should cost that pair, not the whole calibration.
+        """
+        points = []
+        for part in str(text).split(","):
+            part = part.strip()
+            if not part or ":" not in part:
+                continue
+            px, _, wl = part.partition(":")
+            try:
+                points.append((float(px), float(wl)))
+            except ValueError:
+                continue
+        self.points = sorted(points)
+        self.refit()
+        return len(self.points)
+
+    def matches_device_text(self, text):
+        """Whether the device already holds these points.
+
+        Compared as the text that would be sent, so rounding to the stored
+        precision cannot show up as a difference.
+        """
+        try:
+            mine = self.to_device_text()
+        except ValueError:
+            return False
+        return mine == str(text).strip()
 
 
 class Settings:

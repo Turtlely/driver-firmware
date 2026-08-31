@@ -26,7 +26,7 @@ if (-not (Test-Path $launcher)) {
     throw "Launcher not found: $launcher"
 }
 if (-not (Test-Path $icon)) {
-    throw "Icon not found: $icon (expected a built icon.ico next to icon.jpg)"
+    throw "Icon not found: $icon (run: python tools\make_logo.py)"
 }
 
 $pythonExe = if (Test-Path $venvPythonw) {
@@ -37,7 +37,7 @@ $pythonExe = if (Test-Path $venvPythonw) {
 }
 
 $desktop = [Environment]::GetFolderPath("Desktop")
-$shortcutPath = Join-Path $desktop "Spectrometer.lnk"
+$shortcutPath = Join-Path $desktop "Helios.lnk"
 
 $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($shortcutPath)
@@ -45,7 +45,7 @@ $shortcut.TargetPath = $pythonExe
 $shortcut.Arguments = '"' + $launcher + '"'
 $shortcut.WorkingDirectory = $repoRoot
 $shortcut.IconLocation = $icon
-$shortcut.Description = "S3903-1024Q spectrometer application"
+$shortcut.Description = "Helios S3903-1024Q application"
 $shortcut.Save()
 
 Write-Output "Created: $shortcutPath"
