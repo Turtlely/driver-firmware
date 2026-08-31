@@ -1,0 +1,4 @@
+# Runtime dependencies for the host tools and the Helios application.
+# Tkinter is part of the standard library and is not listed here.
+numpy>=2.0
+pyserial>=3.5

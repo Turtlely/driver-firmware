@@ -10,7 +10,7 @@ from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 
 import numpy as np
 
-from . import export, processing, stkfile, typography
+from . import export, processing, resources, stkfile, typography
 from .calibration import Calibration, Settings
 from .device import (CODEC_NAMES, MAX_CODE, Device, DeviceError,
                      find_devices)
@@ -483,7 +483,7 @@ class SpectrometerApp:
         path, and needs it kept alive: a local would be collected and the
         icon would go blank. Both files come from tools/make_logo.py.
         """
-        here = Path(__file__).resolve().parent
+        here = resources.package_dir()
         ico = here / "icon.ico"
         if sys.platform == "win32" and ico.exists():
             try:

@@ -21,9 +21,10 @@ face available. Nothing else changes.
 
 import sys
 import tkinter.font as tkfont
-from pathlib import Path
 
-FONT_DIR = Path(__file__).resolve().parent / "fonts"
+from .resources import package_dir
+
+FONT_DIR = package_dir() / "fonts"
 
 # Filenames registered with the system, in the order they are tried. Regular
 # and Bold share the family "Inter"; SemiBold is its own family, because the

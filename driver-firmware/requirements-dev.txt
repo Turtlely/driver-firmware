@@ -1,0 +1,5 @@
+# Build-time tools. Neither is needed to run the application.
+-r requirements.txt
+
+pillow>=10.0       # tools/make_logo.py, which draws the icon
+pyinstaller>=6.22  # tools/make_exe.py, which packages the Windows executable

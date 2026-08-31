@@ -27,6 +27,28 @@ desktop, pointing at the `.venv` Python and `tools/spectrometer/icon.ico`.
 Uses `pythonw.exe` so no console window opens alongside the GUI. Safe to
 re-run; it overwrites its own shortcut rather than duplicating it.
 
+**Executable.** `python tools/make_exe.py` packages the application with
+PyInstaller, so a computer with no Python can run it. Output goes to
+`build/exe/dist/Helios/`, which is ignored by git. Add `--onefile` for a
+single `Helios.exe` instead of a folder.
+
+Ship the folder. It puts a window on screen in 0.3 s. The one-file build
+unpacks numpy, tkinter and the Tcl library into a temporary directory
+before it can start, and pays that cost on every launch rather than once,
+which measured 2.2 s here. Two seconds of nothing looks like a program
+that has failed to open. Zip the folder to hand it over. The folder is
+63 MB and the single file is 26 MB.
+
+The build needs PyInstaller, which is a build-time tool and not a runtime
+dependency: `.venv\Scripts\python -m pip install pyinstaller`.
+
+Packaging moves the font files and the icon into the directory
+PyInstaller unpacks at startup. A module that asks for its own directory
+therefore finds nothing. `tools/spectrometer/resources.py` answers the
+question in one place, for the packaged layout and the source layout
+both, and `tools/make_exe.py` names the destination it has to agree with.
+Add any new file that is read at runtime to both.
+
 **Icon.** `python tools/make_logo.py` writes both
 `tools/spectrometer/logo.png`, which the window and the taskbar use, and
 `tools/spectrometer/icon.ico`, which the shortcut uses. It draws every
@@ -796,6 +818,7 @@ tools/
     export.py                  spectrum and reference file formats
     stkfile.py                 stacked capture record format
     typography.py              interface and readout fonts
+    resources.py               where the bundled files are, packaged or not
     app.py                     user interface
     fonts/                     Inter, bundled under the SIL Open Font License
 ```
