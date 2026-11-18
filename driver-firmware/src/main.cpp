@@ -15,22 +15,30 @@
 #include <LittleFS.h>
 #include "pixel_trig.pio.h"
 
+// The Arduino RP2350 core maps Serial2 to hardware UART1. Keep every
+// command, diagnostic and binary record on this same transport.
+static auto &HostSerial = Serial2;
+constexpr uint8_t PIN_HOST_TX = 4;
+constexpr uint8_t PIN_HOST_RX = 5;
+constexpr uint32_t HOST_BAUD = 115200;
+
 // Hardware configuration.
 
 constexpr uint8_t PIN_START = 7;       // OUTPUT: starts one CPLD scan cycle
-constexpr uint8_t PIN_PIXEL_TRIG = 1;  // INPUT:  one pulse per pixel, watched by PIO
-constexpr uint8_t PIN_ADC_SCLK = 10;   // OUTPUT: SPI clock
-constexpr uint8_t PIN_ADC_MISO = 8;    // INPUT:  ADS7279 SDO
-constexpr uint8_t PIN_ADC_MOSI = 12;   // OUTPUT: ADS7279 SDI, held high (see setup)
+constexpr uint8_t PIN_PIXEL_TRIG = 2;//1;  // INPUT:  one pulse per pixel, watched by PIO
+constexpr uint8_t PIN_ADC_SCLK = 14;//10;   // OUTPUT: SPI clock
+constexpr uint8_t PIN_ADC_MISO = 12;//8;    // INPUT:  ADS7279 SDO
+constexpr uint8_t PIN_ADC_MOSI = 15;//12;   // OUTPUT: ADS7279 SDI, held high (see setup)
                                        // GPIO 12 is header pin 16. Moved here
                                        // from GPIO 11, which would not drive.
-constexpr uint8_t PIN_ADC_CS = 9;      // OUTPUT: ADS7279 chip select
+constexpr uint8_t PIN_ADC_CS = 13;//9;      // OUTPUT: ADS7279 chip select
 
 // SD card, on SPI0. The ADC above is bit-banged and uses no SPI
 // peripheral, so the card has the port to itself.
 constexpr uint8_t PIN_SD_MISO = 16;    // INPUT:  card DAT0
 constexpr uint8_t PIN_SD_CS = 17;      // OUTPUT: card chip select
 constexpr uint8_t PIN_SD_SCLK = 18;    // OUTPUT: card clock
+constexpr uint8_t PIN_SD_DET = 20;     // INPUT_PULLUP: LOW when card inserted
 constexpr uint8_t PIN_SD_MOSI = 19;    // OUTPUT: card CMD
 
 // A transfer word is a 4-bit command in D[15:12] plus 12 bits of CFR data in
@@ -130,7 +138,7 @@ constexpr uint32_t REPORT_PIXEL_INDEX = 500;
 //   every 16 pixels stale on ~60 percent of frames, ~0.66 per frame
 //
 // The reasoning that batching would help was wrong. pumpTx() calls
-// Serial.write(buf, chunk) where chunk is whatever has accumulated, so its
+// HostSerial.write(buf, chunk) where chunk is whatever has accumulated, so its
 // cost is dominated by bytes moved, not by call overhead. The frame's ~2100
 // bytes have to go out either way. Batching does not remove that work, it
 // concentrates it: fifteen passes do nothing and the sixteenth moves sixteen
@@ -159,7 +167,8 @@ enum RunMode : uint8_t {
   MODE_CAPTURE = 2,
 };
 
-RunMode g_mode = MODE_LIVE;
+// UART is a command interface; scans continue without live frame output.
+RunMode g_mode = MODE_QUIET;
 
 // Capture state.
 
@@ -264,7 +273,7 @@ TxQueue txQueue;
 // the transfer lasts well under a second.
 bool g_txBinaryLock = false;
 
-// Free space in the USB CDC TX FIFO when nothing is queued. Sampled once at
+// Free space in the host TX FIFO when nothing is queued. Sampled once at
 // boot, then used to tell whether the host has collected what we sent.
 int g_txFifoCapacity = 0;
 
@@ -299,7 +308,7 @@ void pumpTx() {
     g_txHead = g_txTail = 0; // move the head and tail back to origin
     return;
   }
-  const int avail = Serial.availableForWrite(); // returns how many bytes the serial port can accept
+  const int avail = HostSerial.availableForWrite(); // returns how many bytes the serial port can accept
   if (avail <= 0) { // not able to send anything
     return;
   }
@@ -309,34 +318,28 @@ void pumpTx() {
   if (chunk > (size_t)avail) { // if the packet doesnt fit, send as much as we can right now
     chunk = (size_t)avail;
   }
-  Serial.write(g_txBuf + g_txTail, chunk); // write the chunk to serial, update the tail
-  g_txTail += chunk;
+  const size_t written = HostSerial.write(g_txBuf + g_txTail, chunk);
+  g_txTail += written;
   if (txPending() == 0) { // see if we cleared out the queue yet.
     g_txHead = g_txTail = 0;
   }
 }
 
-// accepts a C string and loads it into the queue.
-// 510 character max limit. +1 newline.
-//
-// The buffer was 320 bytes. emitDeviceInfo() outgrew that when the stacking
-// fields were added, and the truncation here is silent: the line simply
-// arrives short and the host parses whatever survived. Sized with headroom
-// rather than to fit, because that failure leaves no trace.
+// Queue one terminal-friendly text line, including CRLF atomically.
 bool txLine(const char *text) {
   if (g_txBinaryLock) {
-    return false;  // see g_txBinaryLock: text here would split the record
+    return false;  // text here would split an explicitly requested record
   }
-  const size_t n = strlen(text); // # of characters in text, each character is 1 byte
-  if (n + 1 > txFree()) { // if # of characters + /n char exceeds the number of free bytes left in queue. 
-    return false; // doesnt fit so we dont do anything
+  char buf[512];
+  const size_t n = strlen(text);
+  const size_t take = (n < sizeof(buf) - 2) ? n : sizeof(buf) - 2;
+  if (take + 2 > txFree()) {
+    return false;
   }
-  char buf[512]; // define character buffer that can hold 512 bytes max
-  // silently truncates the text to fit in the buffer
-  const size_t take = (n < sizeof(buf) - 2) ? n : sizeof(buf) - 2; // if n < 318 chars, take=n. else, take=318
-  memcpy(buf, text, take); // copy that text packet into the buffer
-  buf[take] = '\n'; // append a newline to the end
-  return txAppend(buf, take + 1); // TODO can probably remove the +1 here?
+  memcpy(buf, text, take);
+  buf[take] = '\r';
+  buf[take + 1] = '\n';
+  return txAppend(buf, take + 2);
 }
 
 // Whether a live frame of `need` bytes may enter the queue right now.
@@ -1015,7 +1018,7 @@ void initPixelTrigPio() {
            "BOOT: refractory %luus (%lu cycles) txlevel %lu (1 = loaded, 0 = DEAD)",
            (unsigned long)REFRACTORY_US, (unsigned long)refractoryCycles(),
            (unsigned long)g_refractoryTxLevel);
-  Serial.println(stamp);
+  HostSerial.println(stamp);
 }
 
 // raw edge state machine used for debugging, compare the raw edges to the debounced edges.
@@ -1064,7 +1067,7 @@ void printPioBuildStamp() {
            (unsigned long)REFRACTORY_US, (unsigned long)refractoryCycles(),
            (unsigned long)(clock_get_hz(clk_sys) / 1000000u),
            __DATE__, __TIME__);
-  Serial.println(line);
+  HostSerial.println(line);
 }
 
 // ===========================================================================
@@ -2097,7 +2100,7 @@ void runFrame(uint32_t frameStartTimeUs) {
     // That line is queued about 30 us before START, and loop() cannot drain
     // it because we are already inside runFrame(). So it sat in the queue
     // until the first pumpTx() of the capture loop, which runs immediately
-    // after pixel 0. One ~110 byte Serial.write landing there is enough to
+    // after pixel 0. One ~110 byte HostSerial.write landing there is enough to
     // push that loop pass past the 20 us pixel period, which queues a second
     // trigger, which costs a pixel.
     //
@@ -2112,22 +2115,10 @@ void runFrame(uint32_t frameStartTimeUs) {
       pumpTx();
     }
 
-    // Then wait for the HOST to collect it, which is a separate event.
-    //
-    // pumpTx() only moves bytes into the TinyUSB FIFO. The Pico is a
-    // full-speed device, so the host schedules bulk IN transfers on 1 ms
-    // frame boundaries, and the completion interrupt for that packet was
-    // landing inside the scan. Measured with the flush alone: staleat spread
-    // uniformly over 3 to 50 and never outside it. 50 pixels at 20 us is
-    // 1000 us - one USB frame, which is the signature of exactly that.
-    //
-    // availableForWrite() runs tud_task(), so polling it also drives the
-    // transfer forward. It returns to the full FIFO size only once the host
-    // has read, so the interrupt is behind us when this loop exits.
-    //
-    // Bounded: a host that stops reading delays the frame by 5 ms and shows
-    // up in "late" rather than hanging the loop.
-    while (Serial.availableForWrite() < g_txFifoCapacity &&
+    // Bound the wait for transmitter space before starting the scan.
+    // On UART, availableForWrite() reports whether another byte fits; it
+    // does not mean the computer has received or processed the data.
+    while (HostSerial.availableForWrite() < g_txFifoCapacity &&
            (uint32_t)(micros() - flushStartUs) < 5000) {
     }
 
@@ -3043,7 +3034,7 @@ constexpr uint32_t SD_SEQ_MAX = 999999;
 // Clock rates tried at mount, fastest first. See test/../src/sd_test.cpp:
 // a card that only answers at a low rate is a wiring fault, not a slow card,
 // and the rate that worked is reported so that fault stays visible.
-constexpr uint32_t SD_CLOCK_TRY_MHZ[] = {24, 16, 8, 4};
+constexpr uint32_t SD_CLOCK_TRY_MHZ[] = {24, 16, 8, 4, 1};
 
 // Pixels per write. The same chunk size the transmitter uses, so both paths
 // build the record with one buffer of the same shape.
@@ -3212,9 +3203,9 @@ static void sdScanDirectory() {
   char name[64];
   while (entry.openNext(&dir, O_RDONLY)) {
     entry.getName(name, sizeof(name));
-    const uint32_t seq = sdSeqFromName(name);
+    const uint32_t seq = entry.isDir() ? 0 : sdSeqFromName(name);
+    if (!entry.isDir()) ++g_sdState.filesAtMount;
     if (seq != 0) {
-      ++g_sdState.filesAtMount;
       if (seq >= g_sdState.nextSeq) {
         g_sdState.nextSeq = seq + 1;
       }
@@ -3224,7 +3215,16 @@ static void sdScanDirectory() {
   dir.close();
 }
 
+// Socket DET is a mechanical switch to ground, independent of SPI/FAT.
+static bool sdCardInserted() {
+  return digitalRead(PIN_SD_DET) == LOW;
+}
+
 bool sdMount() {
+  if (!sdCardInserted()) {
+    sdSetError("card absent (DET high)");
+    return false;
+  }
   if (g_sdState.mounted) {
     return true;
   }
@@ -3251,7 +3251,7 @@ bool sdMount() {
   }
   g_sdState.mounted = false;
   g_sdState.clockMhz = 0;
-  sdSetError("no card, or wiring fault");
+  sdSetError("card inserted; SPI or filesystem failure");
   return false;
 }
 
@@ -3261,6 +3261,30 @@ void sdUnmount() {
   }
   g_sdState.mounted = false;
   g_sdState.clockMhz = 0;
+}
+
+// Called between scans. Debounce the socket switch without delaying acquisition.
+void sdPollDetect() {
+  static bool candidate = sdCardInserted();
+  static bool stable = candidate;
+  static uint32_t changedMs = millis();
+  const bool inserted = sdCardInserted();
+  if (inserted != candidate) {
+    candidate = inserted;
+    changedMs = millis();
+  }
+  if (candidate == stable || (uint32_t)(millis() - changedMs) < 50) return;
+  stable = candidate;
+  if (stable) {
+    const bool mounted = sdMount();
+    txLine(mounted ? "D card inserted=1 mounted=1" :
+                     "D card inserted=1 mounted=0");
+  } else {
+    sdUnmount();
+    g_sdState.filesAtMount = 0;
+    sdSetError("card removed");
+    txLine("D card inserted=0 mounted=0");
+  }
 }
 
 // Assembles the whole record into out, checksum included.
@@ -3564,7 +3588,7 @@ static void sdEmitFileLine(const char *name, uint32_t bytes, uint16_t date,
   uint16_t codec = SD_CODEC_NONE;
   bool valid = false;
 
-  char path[SD_NAME_MAX + sizeof(SD_DIR) + 1];
+  char path[256 + sizeof(SD_DIR) + 1];
   sdBuildPath(path, sizeof(path), name);
   FsFile f = g_sd.open(path, O_RDONLY);
   if (f) {
@@ -3611,7 +3635,7 @@ static void sdEmitFileLine(const char *name, uint32_t bytes, uint16_t date,
   const uint8_t minute = (uint8_t)((timeField >> 5) & 0x3F);
   const uint8_t second = (uint8_t)((timeField & 0x1F) * 2);
 
-  char line[200];
+  char line[512];
   snprintf(line, sizeof(line),
            "D file name=%s bytes=%lu plain=%lu codec=%u tag=%c%c id=%lu req=%lu "
            "stack=%lu exp_us=%lu dur_ms=%lu dark=%d valid=%d "
@@ -3637,7 +3661,7 @@ void sdList(uint32_t start, uint32_t count) {
   // directory with its own handle, and opening a file inside that walk moves
   // the shared volume cache under it.
   struct Entry {
-    char name[SD_NAME_MAX];
+    char name[256];
     uint32_t bytes;
     uint16_t date;
     uint16_t time;
@@ -3648,12 +3672,12 @@ void sdList(uint32_t start, uint32_t count) {
   uint32_t taken = 0;
   uint32_t total = 0;
   FsFile entry;
-  char name[64];
+  char name[256];
   while (entry.openNext(&dir, O_RDONLY)) {
     entry.getName(name, sizeof(name));
-    if (sdSeqFromName(name) != 0) {
+    if (!entry.isDir()) {
       if (index >= start && taken < count) {
-        snprintf(page[taken].name, SD_NAME_MAX, "%s", name);
+        snprintf(page[taken].name, sizeof(page[taken].name), "%s", name);
         page[taken].bytes = (uint32_t)entry.fileSize();
         uint16_t d = 0, t = 0;
         entry.getModifyDateTime(&d, &t);
@@ -3745,9 +3769,11 @@ void pumpFileSend() {
 }
 
 void emitSdStatus(bool withFree) {
-  char line[240];
+  char line[512];
   if (!g_sdState.mounted) {
-    snprintf(line, sizeof(line), "D state=absent mounted=0 auto=%d error=%s",
+    snprintf(line, sizeof(line), "D state=%s mounted=0 inserted=%d det=%d auto=%d error=%s",
+             sdCardInserted() ? "unmounted" : "absent",
+             (int)sdCardInserted(), digitalRead(PIN_SD_DET),
              (int)g_sdState.autoSave,
              g_sdState.lastError[0] ? g_sdState.lastError : "none");
     txLine(line);
@@ -3786,11 +3812,12 @@ void emitSdStatus(bool withFree) {
 
   const uint64_t sizeMb = (uint64_t)g_sd.card()->sectorCount() / 2048u;
   snprintf(line, sizeof(line),
-           "D state=ok mounted=1 mhz=%lu fat=%d size_mb=%lu vol_mb=%lu "
+           "D state=ok mounted=1 inserted=%d det=%d mhz=%lu fat=%d size_mb=%lu vol_mb=%lu "
            "free_mb=%ld "
            "next=%lu files=%lu writes=%lu werr=%lu auto=%d clock=%d "
            "codec=%s codec_n=%u last=%s last_plain=%lu last_stored=%lu "
            "error=%s",
+           (int)sdCardInserted(), digitalRead(PIN_SD_DET),
            (unsigned long)g_sdState.clockMhz, (int)g_sd.fatType(),
            (unsigned long)sizeMb, (unsigned long)volMb, (long)freeMb,
            (unsigned long)g_sdState.nextSeq,
@@ -4305,19 +4332,18 @@ void handleCommand(const char *cmd) {
     return;
   }
 
-  // Stops and starts frame transmission without stopping the scan. The
-  // scan keeps running in either case, so the detector never sits
-  // integrating with nothing to flush it and the first frame after "live 1"
-  // is as valid as any other.
+  // UART carries commands and replies, never unsolicited live spectra.
   if (strncmp(cmd, "live ", 5) == 0) {
     if (g_mode == MODE_CAPTURE) {
       txLine("E live busy_capturing");
       return;
     }
-    g_mode = (atol(cmd + 5) != 0) ? MODE_LIVE : MODE_QUIET;
-    char line[48];
-    snprintf(line, sizeof(line), "A live=%d", (int)(g_mode == MODE_LIVE));
-    txLine(line);
+    if (atol(cmd + 5) != 0) {
+      txLine("E live unsupported_uart");
+      return;
+    }
+    g_mode = MODE_QUIET;
+    txLine("A live=0");
     return;
   }
 
@@ -4356,8 +4382,8 @@ void pollHostCommands() {
   static char buf[384];
   static uint8_t len = 0;
 
-  while (Serial.available() > 0) {
-    const char ch = (char)Serial.read();
+  while (HostSerial.available() > 0) {
+    const char ch = (char)HostSerial.read();
     if (ch == '\n' || ch == '\r') {
       if (len > 0) {
         buf[len] = '\0';
@@ -4377,6 +4403,7 @@ void pollHostCommands() {
 // ===========================================================================
 
 void setup() {
+  pinMode(PIN_SD_DET, INPUT_PULLUP);
   pinMode(PIN_START, OUTPUT);
   digitalWrite(PIN_START, LOW);
 
@@ -4394,18 +4421,16 @@ void setup() {
   pinMode(PIN_ADC_SCLK, OUTPUT);
   digitalWrite(PIN_ADC_SCLK, LOW);  // firmware drives SCLK for each transfer
 
-  Serial.begin(115200);
-  // USB CDC reads false until the host asserts DTR. This loop therefore waits
-  // for a terminal to open the port, so the boot lines cannot scroll past
-  // unseen. Capture has not started.
-  while (!Serial) {
-    delay(10);
-  }
-  delay(100);
+  HostSerial.setTX(PIN_HOST_TX);
+  HostSerial.setRX(PIN_HOST_RX);
+  // Buffer incoming commands while a scan occupies the main loop.
+  HostSerial.setFIFOSize(1024);
+  HostSerial.begin(HOST_BAUD, SERIAL_8N1);
+  // Hardware UART starts immediately; no USB connection or DTR is needed.
 
-  g_txFifoCapacity = Serial.availableForWrite();  // nothing queued yet
-  Serial.println("BOOT: RP2350 firmware active");
-  Serial.println("BOOT: PIO debounces the pixel trigger, not an interrupt");
+  g_txFifoCapacity = HostSerial.availableForWrite();  // nothing queued yet
+  HostSerial.println("BOOT: RP2350 firmware active");
+  HostSerial.println("BOOT: PIO debounces the pixel trigger, not an interrupt");
   printPioBuildStamp();
 
   // Before emitDeviceInfo(), because the "I " line reports how many
@@ -4416,13 +4441,13 @@ void setup() {
   g_cal.fsReady = LittleFS.begin();
   calLoad();
   if (!g_cal.fsReady) {
-    Serial.println("BOOT: no calibration store (flash filesystem would not "
+    HostSerial.println("BOOT: no calibration store (flash filesystem would not "
                    "mount)");
   } else if (g_cal.points >= 2) {
-    Serial.printf("BOOT: calibration loaded, %lu points\n",
+    HostSerial.printf("BOOT: calibration loaded, %lu points\r\n",
                   (unsigned long)g_cal.points);
   } else {
-    Serial.println("BOOT: no calibration stored");
+    HostSerial.println("BOOT: no calibration stored");
   }
 
   // The SPI self check, then the ADC reset. Both run on every boot, and
@@ -4449,7 +4474,7 @@ void setup() {
   //
   // Repeat it at any time with "selftest".
   if (!runSelfTest()) {
-    Serial.println("BOOT: self test FAILED; see the H sditest and H adcreset "
+    HostSerial.println("BOOT: self test FAILED; see the H sditest and H adcreset "
                    "lines above");
   }
 
@@ -4459,12 +4484,14 @@ void setup() {
   // absent or miswired is then a line in the boot log, not a capture that
   // completes and quietly stores nothing. Failure is not fatal: the
   // instrument runs without a card, and "sd mount" retries at any time.
+  HostSerial.printf("BOOT: SD DET GPIO %u=%d inserted=%d (active LOW)\r\n",
+                PIN_SD_DET, digitalRead(PIN_SD_DET), (int)sdCardInserted());
   if (sdMount()) {
-    Serial.printf("BOOT: SD card mounted at %lu MHz, next file %06lu\n",
+    HostSerial.printf("BOOT: SD card mounted at %lu MHz, next file %06lu\r\n",
                   (unsigned long)g_sdState.clockMhz,
                   (unsigned long)g_sdState.nextSeq);
   } else {
-    Serial.printf("BOOT: no SD card (%s); captures will not be stored\n",
+    HostSerial.printf("BOOT: no SD card (%s); captures will not be stored\r\n",
                   g_sdState.lastError);
   }
 
@@ -4506,6 +4533,7 @@ void loop() {
   // A finished capture is written to the card here, not in captureFinish().
   // The write can stall for tens of milliseconds and captureFinish() runs
   // inside runFrame().
+  sdPollDetect();
   sdServicePendingSave();
   // Commands run between frames, never during a scan. A command therefore
   // cannot disturb the pixel timing.

@@ -42,7 +42,7 @@ struct FakeSerial {
     g_wire.insert(g_wire.end(), data, data + len);
     return len;
   }
-} Serial;
+} HostSerial;
 
 static uint32_t g_nowUs = 0;
 static uint32_t micros() { return g_nowUs; }
@@ -81,6 +81,14 @@ int main() {
 #ifdef _WIN32
   _setmode(_fileno(stdout), _O_BINARY);
 #endif
+  // UART terminals need both carriage return and line feed.
+  txLine("A test");
+  while (txPending() > 0) pumpTx();
+  const char expected[] = "A test\r\n";
+  if (g_wire.size() != sizeof(expected) - 1 ||
+      memcmp(g_wire.data(), expected, sizeof(expected) - 1) != 0) return 2;
+  g_wire.clear();
+
   capture.id = 7;
   capture.dark = true;
   capture.framesRequested = 150;
